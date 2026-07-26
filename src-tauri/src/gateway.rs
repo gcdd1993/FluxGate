@@ -2,7 +2,7 @@ use crate::{
     cache_injector,
     db::Database,
     models::{ClientKind, GatewayConfig, ModelAlias, Provider, RequestLog},
-    rectifier,
+    openai_compat, rectifier,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -887,12 +887,12 @@ fn adapt_request(
             serde_json::to_vec(&body).unwrap_or_default(),
         );
     }
-    if matches!(client, ClientKind::Claude) && protocol == "openai" && path.ends_with("/messages") {
-        let mut messages = payload.get("messages").cloned().unwrap_or(json!([]));
-        if let (Some(system), Some(items)) = (payload.get("system"), messages.as_array_mut()) {
-            items.insert(0, json!({"role":"system","content":system}));
-        }
-        let body = json!({"model":payload.get("model"),"messages":messages,"stream":payload.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_tokens":payload.get("max_tokens")});
+    if matches!(client, ClientKind::Claude)
+        && protocol == "openai"
+        && path.ends_with("/messages")
+        && payload.is_object()
+    {
+        let body = openai_compat::claude_request_to_openai(payload);
         return (
             "/v1/chat/completions".into(),
             serde_json::to_vec(&body).unwrap_or_default(),
@@ -946,9 +946,7 @@ fn adapt_response(client: &ClientKind, protocol: &str, raw: bytes::Bytes) -> byt
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let converted = match client {
-        ClientKind::Claude => {
-            json!({"id":v.get("id"),"type":"message","role":"assistant","model":model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":input,"output_tokens":output}})
-        }
+        ClientKind::Claude => openai_compat::openai_response_to_claude(&v),
         ClientKind::Codex => {
             json!({"id":v.get("id"),"object":"response","created_at":Utc::now().timestamp(),"status":"completed","model":model,"output":[{"type":"message","id":format!("msg_{}",uuid::Uuid::new_v4()),"status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}],"usage":{"input_tokens":input,"output_tokens":output,"total_tokens":input+output}})
         }
@@ -1144,22 +1142,49 @@ async fn stream_response(
     }
     let combined: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>> =
         Box::pin(stream::once(async move { Ok(first) }).chain(upstream));
+    // Claude clients riding an OpenAI-protocol upstream get their SSE stream
+    // rewritten into Anthropic Messages events; the meter keeps reading the
+    // raw upstream chunks so usage accounting is unaffected.
+    let translate = matches!(log_context.client, ClientKind::Claude)
+        && log_context.provider.protocol == "openai";
     let meter = StreamUsageMeter::new(log_context, status);
+    let translator = translate.then(openai_compat::SseTranslator::new);
     let metered = stream::unfold(
-        (combined, meter),
-        move |(mut upstream, mut meter)| async move {
+        (combined, meter, translator, false),
+        move |(mut upstream, mut meter, mut translator, done)| async move {
+            if done {
+                return None;
+            }
             match upstream.next().await {
                 Some(Ok(chunk)) => {
                     meter.push(&chunk);
-                    Some((Ok::<_, reqwest::Error>(chunk), (upstream, meter)))
+                    let emitted = match translator.as_mut() {
+                        Some(translator) => bytes::Bytes::from(translator.push(&chunk)),
+                        None => chunk,
+                    };
+                    Some((
+                        Ok::<_, reqwest::Error>(emitted),
+                        (upstream, meter, translator, false),
+                    ))
                 }
                 Some(Err(error)) => {
                     meter.finish(Some(error.to_string())).await;
-                    Some((Err(error), (upstream, meter)))
+                    Some((Err(error), (upstream, meter, translator, true)))
                 }
                 None => {
                     meter.finish(None).await;
-                    None
+                    let tail = translator
+                        .as_mut()
+                        .map(|translator| translator.finish())
+                        .unwrap_or_default();
+                    if tail.is_empty() {
+                        None
+                    } else {
+                        Some((
+                            Ok(bytes::Bytes::from(tail)),
+                            (upstream, meter, translator, true),
+                        ))
+                    }
                 }
             }
         },
@@ -1920,6 +1945,99 @@ data: [DONE]
         assert!(String::from_utf8_lossy(&body).contains("backup-ok"));
         failed_server.abort();
         healthy_server.abort();
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn claude_stream_through_openai_provider_is_translated_to_anthropic_events() {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let handler_bodies = bodies.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let bodies = handler_bodies.clone();
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(concat!(
+                            "data: {\"id\":\"chat_1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n",
+                        )))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = Provider {
+            id: "p1".into(),
+            name: "p1".into(),
+            protocol: "openai".into(),
+            base_url: format!("http://{address}/v1"),
+            api_key: "test".into(),
+            enabled: true,
+            priority: 1,
+            client: "claude".into(),
+            health: "healthy".into(),
+            failures: 0,
+            models: Vec::new(),
+            custom_user_agent: None,
+            balance: Default::default(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "fluxgate-claude-openai-stream-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(Database::open(&path).unwrap());
+        let state = Arc::new(GatewayState::new(
+            db,
+            GatewayConfig::default(),
+            vec![provider],
+            Vec::new(),
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-api-key", "client-key")
+            .body(Body::from(
+                json!({
+                    "model": "m",
+                    "stream": true,
+                    "max_tokens": 64,
+                    "system": "be helpful",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = proxy_inner(state.clone(), request, Instant::now()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // The upstream received a converted chat/completions payload…
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent[0]["messages"][0]["role"], "system");
+        assert_eq!(sent[0]["messages"][1]["content"], "hi");
+        assert_eq!(sent[0]["stream_options"]["include_usage"], true);
+        // …and the client got Anthropic Messages events back.
+        assert!(text.contains("event: message_start"));
+        assert!(text.contains("\"text_delta\""));
+        assert!(text.contains("Hel"));
+        assert!(text.contains("\"stop_reason\":\"end_turn\""));
+        assert!(text.contains("\"output_tokens\":2"));
+        assert!(text.contains("event: message_stop"));
+        assert!(!text.contains("chat.completion"));
+        assert!(!text.contains("[DONE]"));
+        server.abort();
         drop(state);
         let _ = std::fs::remove_file(path);
     }

@@ -3,6 +3,7 @@ mod cache_injector;
 mod db;
 mod gateway;
 mod models;
+mod openai_compat;
 mod rectifier;
 mod storage;
 mod takeover;
