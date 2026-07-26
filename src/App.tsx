@@ -1,13 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import {
-  Activity, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, CircleGauge,
-  Clock3, Copy, Database, Gauge, KeyRound, Layers3, ListFilter, Menu, Network,
-  Pencil, Plus, Power, RefreshCw, RotateCcw, Route, Search, Server, Settings,
-  ShieldCheck, Trash2, TriangleAlert, X, Zap,
+  Activity, Archive, ArrowDown, ArrowUp, BarChart3, Blocks, Check, ChevronDown, CircleGauge,
+  Clock3, CloudDownload, CloudUpload, Copy, CopyPlus, Database, FolderOpen, Gauge, HardDrive,
+  KeyRound, Layers3, ListFilter, Menu, Network,
+  GripVertical, Pencil, Plus, Power, RefreshCw, RotateCcw, Route, Search, Server, Settings,
+  ShieldCheck, Sparkles, SquareTerminal, Trash2, TriangleAlert, Wallet, X, Zap,
 } from "lucide-react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { deleteAlias, deleteProvider, fetchProviderModels, getDashboard, resetCircuit, saveAlias, saveConfig, saveProvider, seedDemo } from "./lib/api";
-import type { AliasTarget, ClientKind, DashboardData, GatewayConfig, ModelAlias, Provider, UsageFilter } from "./types";
+import { backupDelete, backupList, backupNow, backupRestore, checkUpdate, chooseDirectory, deleteAlias, deleteProvider, fetchProviderBalance, fetchProviderModels, getDashboard, getStorageInfo, installUpdate, openDataDirectory, resetCircuit, resetDataDirectory, restartApp, saveAlias, saveConfig, saveProvider, setDataDirectory, webdavDownload, webdavTest, webdavUpload } from "./lib/api";
+import type { AliasTarget, BackupEntry, BalanceInfo, BalanceQuery, ClientKind, DashboardData, GatewayConfig, ModelAlias, Provider, StorageInfo, UpdateInfo, UsageFilter, WebdavConfig } from "./types";
 
 type Page = "overview" | "routing" | "providers" | "models" | "usage" | "logs" | "settings";
 const nav: { id: Page; label: string; icon: typeof Activity }[] = [
@@ -16,7 +17,17 @@ const nav: { id: Page; label: string; icon: typeof Activity }[] = [
   { id: "usage", label: "使用统计", icon: BarChart3 }, { id: "logs", label: "请求日志", icon: Database },
 ];
 const clientLabel: Record<string, string> = { all: "全部客户端", codex: "Codex", claude: "Claude", openai: "OpenAI 兼容" };
+const providerTabs: { id: ClientKind; label: string; endpoint: string }[] = [
+  { id: "codex", label: "Codex", endpoint: "/v1/responses" },
+  { id: "claude", label: "Claude", endpoint: "/v1/messages" },
+  { id: "openai", label: "OpenAI 兼容", endpoint: "/v1/chat/completions" },
+];
 const emptyFilter: UsageFilter = { range: "7d", client: "all", provider: "", model: "" };
+const protocolLabel: Record<string, string> = { openai: "Chat Completions", responses: "Responses", anthropic: "Messages" };
+const tabIcon: Record<ClientKind, typeof Activity> = { codex: SquareTerminal, claude: Sparkles, openai: Blocks };
+const initials = (name: string) => { const t = name.trim(); if (!t) return "?"; if (/[⺀-鿿぀-ヿ가-힯]/.test(t[0])) return t[0]; const words = t.split(/\s+/).filter(w => /[a-zA-Z0-9]/.test(w[0])); if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase(); const latin = t.replace(/[^a-zA-Z0-9]/g, "").slice(0, 2).toUpperCase(); return latin || t[0].toUpperCase(); };
+const nameHue = (name: string) => { let h = 7; for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360; return h; };
+const avatarStyle = (name: string) => ({ "--hue": String(nameHue(name)) } as React.CSSProperties);
 
 const uid = () => crypto.randomUUID();
 const fmt = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}K` : n.toLocaleString();
@@ -38,6 +49,7 @@ export default function App() {
     finally { setLoading(false); }
   };
   useEffect(() => { void refresh(); }, []);
+  useEffect(() => { const timer = setTimeout(() => { checkUpdate().then(info => { if (info) setToast(`发现新版本 v${info.version}，可在设置页更新`); }).catch(() => { /* 静默：离线或未发布 Release 时不打扰 */ }); }, 3000); return () => clearTimeout(timer); }, []);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 3500); return () => clearTimeout(timer); }, [toast]);
   const updateFilter = (next: UsageFilter) => { setFilter(next); void refresh(next); };
 
@@ -48,22 +60,22 @@ export default function App() {
       <a className="skip-link" href="#main">跳到主要内容</a>
       <aside className={`sidebar ${sidebar ? "open" : ""}`} aria-label="主导航">
         <div className="brand"><span className="brand-mark"><Zap size={19} /></span><span><b>FluxGate</b><small>LOCAL AI GATEWAY</small></span></div>
-        <nav>{nav.map(item => <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => { setPage(item.id); setSidebar(false); }}><item.icon size={18} /><span>{item.label}</span>{item.id === "routing" && <i className={`nav-dot ${data.config.enabled ? "live" : ""}`} />}</button>)}</nav>
+        <nav>{nav.map(item => <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => { setPage(item.id); setSidebar(false); }}><item.icon size={18} /><span>{item.label}</span>{item.id === "routing" && <i className="nav-dot live" />}</button>)}</nav>
         <div className="sidebar-foot">
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}><Settings size={18} />设置</button>
-          <div className="gateway-mini"><span className={`pulse ${data.config.enabled ? "live" : ""}`} /><span><b>{data.config.enabled ? "网关运行中" : "网关已暂停"}</b><small>{data.config.host}:{data.config.port}</small></span></div>
+          <div className="gateway-mini"><span className="pulse live" /><span><b>网关运行中</b><small>{data.config.host}:{data.config.port}</small></span></div>
         </div>
       </aside>
-      <header className="topbar"><button className="icon-btn menu-btn" aria-label="打开导航" onClick={() => setSidebar(v => !v)}><Menu /></button><div><span className="eyebrow">CONTROL PLANE</span><h1>{current}</h1></div><div className="top-actions"><span className={`status-chip ${data.config.enabled ? "success" : "neutral"}`}><span className="pulse live" />{data.config.enabled ? "运行中" : "已暂停"}</span><button className="icon-btn" aria-label="刷新数据" onClick={() => void refresh()}><RefreshCw size={18} className={loading ? "spin" : ""} /></button></div></header>
+      <header className="topbar"><button className="icon-btn menu-btn" aria-label="打开导航" onClick={() => setSidebar(v => !v)}><Menu /></button><div><span className="eyebrow">CONTROL PLANE</span><h1>{current}</h1></div><div className="top-actions"><span className="status-chip success"><span className="pulse live" />运行中</span><button className="icon-btn" aria-label="刷新数据" onClick={() => void refresh()}><RefreshCw size={18} className={loading ? "spin" : ""} /></button></div></header>
       <main id="main">
         {loading && <div className="loading-line" />}
         {page === "overview" && <Overview data={data} go={setPage} />}
         {page === "routing" && <Routing data={data} onChange={async config => { await saveConfig(config); setData({ ...data, config }); setToast("路由配置已保存"); }} onReset={async id => { await resetCircuit(id); await refresh(); setToast("熔断状态已重置"); }} />}
-        {page === "providers" && <Providers data={data} refresh={refresh} notify={setToast} />}
+        {page === "providers" && <Providers data={data} refresh={refresh} notify={setToast} onConfig={async config => { await saveConfig(config); setData({ ...data, config }); }} />}
         {page === "models" && <Models data={data} refresh={refresh} notify={setToast} />}
         {page === "usage" && <Usage data={data} filter={filter} updateFilter={updateFilter} />}
         {page === "logs" && <Logs data={data} filter={filter} updateFilter={updateFilter} />}
-        {page === "settings" && <SettingsPage data={data} onChange={async config => { await saveConfig(config); setData({ ...data, config }); setToast("设置已保存"); }} onSeed={async () => { await seedDemo(); await refresh(); setToast("示例统计数据已写入"); }} />}
+        {page === "settings" && <SettingsPage data={data} notify={setToast} onChange={async config => { await saveConfig(config); setData({ ...data, config }); setToast("设置已保存"); }} />}
       </main>
       {sidebar && <button className="scrim" aria-label="关闭导航" onClick={() => setSidebar(false)} />}
       {toast && <div className="toast" role="status"><Check size={17} />{toast}</div>}
@@ -105,12 +117,10 @@ function Overview({ data, go }: { data: DashboardData; go: (page: Page) => void 
 function Routing({ data, onChange, onReset }: { data: DashboardData; onChange: (c: GatewayConfig) => void; onReset: (id: string) => void }) {
   const [config, setConfig] = useState(data.config);
   const update = (patch: Partial<GatewayConfig>) => { const next = { ...config, ...patch }; setConfig(next); void onChange(next); };
-  const flipClient = (client: ClientKind) => update({ clients: { ...config.clients, [client]: !config.clients[client] } });
   const flipFailover = (client: ClientKind) => update({ autoFailover: { ...config.autoFailover, [client]: !config.autoFailover[client] } });
   return <div className="page-stack">
-    <SectionHead eyebrow="ROUTING ENGINE" title="本地路由" text="控制流量接管、供应商优先级和故障恢复策略" />
-    <section className={`gateway-banner ${config.enabled ? "online" : ""}`}><div className="gateway-orb"><Power /></div><div><span className="eyebrow">GATEWAY SERVICE</span><h3>{config.enabled ? "网关正在监听" : "网关已暂停转发"}</h3><p>http://{config.host}:{config.port} · 运行 {duration(data.uptimeSeconds)}</p></div><label className="switch"><input type="checkbox" checked={config.enabled} onChange={() => update({ enabled: !config.enabled })} /><span /></label></section>
-    <section className="panel"><SectionHead eyebrow="CLIENT TAKEOVER" title="客户端接管" text="为不同 API 协议独立启用本地路由" /><div className="client-grid">{(["codex", "claude", "openai"] as ClientKind[]).map(client => <article className={config.clients[client] ? "client-card selected" : "client-card"} key={client}><div className="client-logo">{client === "codex" ? "CX" : client === "claude" ? "CL" : "AI"}</div><div><b>{clientLabel[client]}</b><small>{client === "claude" ? "/v1/messages" : client === "codex" ? "/v1/responses" : "/v1/chat/completions"}</small></div><label className="switch small"><input type="checkbox" checked={config.clients[client]} onChange={() => flipClient(client)} /><span /></label></article>)}</div></section>
+    <SectionHead eyebrow="ROUTING ENGINE" title="本地路由" text="路由服务始终运行，在供应商不可用时按优先级自动恢复" />
+    <section className="gateway-banner online"><div className="gateway-orb"><Route /></div><div><span className="eyebrow">ALWAYS ON</span><h3>网关正在监听</h3><p>http://{config.host}:{config.port} · 运行 {duration(data.uptimeSeconds)}</p></div><span className="always-on-badge"><span className="pulse live" />始终开启</span></section>
     <section className="panel"><div className="split-head"><SectionHead eyebrow="FAILOVER" title="自动故障转移队列" text="按优先级尝试健康供应商；失败时自动切换" /><div className="field inline"><label>客户端</label><select aria-label="故障转移客户端"><option>全部队列</option></select></div></div>
       <div className="routing-columns">{(["codex", "claude", "openai"] as ClientKind[]).map(client => <div className="route-queue" key={client}><div className="queue-head"><div><b>{clientLabel[client]}</b><small>{data.providers.filter(p => p.client === client || p.client === "all").length} 个供应商</small></div><label className="switch small"><input type="checkbox" checked={config.autoFailover[client]} onChange={() => flipFailover(client)} /><span /></label></div>{data.providers.filter(p => p.client === client || p.client === "all").sort((a,b) => a.priority-b.priority).map((p, i) => <div className="queue-item" key={p.id}><span className="priority">P{i + 1}</span><div><b>{p.name}</b><small>{p.protocol} · {p.baseUrl.replace(/^https?:\/\//, "")}</small></div><Health status={p.health} />{p.health === "circuit_open" && <button className="icon-btn tiny" aria-label={`重置 ${p.name} 熔断`} onClick={() => onReset(p.id)}><RotateCcw size={14} /></button>}</div>)}</div>)}</div>
     </section>
@@ -118,23 +128,88 @@ function Routing({ data, onChange, onReset }: { data: DashboardData; onChange: (
   </div>;
 }
 
-function Providers({ data, refresh, notify }: { data: DashboardData; refresh: () => Promise<void>; notify: (s: string) => void }) {
+function Providers({ data, refresh, notify, onConfig }: { data: DashboardData; refresh: () => Promise<void>; notify: (s: string) => void; onConfig: (config: GatewayConfig) => Promise<void> | void }) {
   const [edit, setEdit] = useState<Provider | null>(null);
-  const blank = (): Provider => ({ id: uid(), name: "", protocol: "openai", baseUrl: "https://", apiKey: "", enabled: true, priority: data.providers.length + 1, client: "all", health: "healthy", failures: 0, models: [], customUserAgent: "" });
-  const submit = async (p: Provider) => { await saveProvider(p); setEdit(null); await refresh(); notify("供应商已保存"); };
-  return <div className="page-stack"><SectionHead eyebrow="UPSTREAMS" title="供应商" text="管理认证、协议、端点与路由优先级" action={<button className="primary" onClick={() => setEdit(blank())}><Plus size={17} />添加供应商</button>} />
-    <div className="provider-grid">{data.providers.map(p => <article className="provider-card" key={p.id}><div className="provider-card-top"><div className="provider-avatar large">{p.name.slice(0,2).toUpperCase()}</div><Health status={p.health} /></div><h3>{p.name}</h3><p>{p.baseUrl}</p><div className="tag-row"><span className="tag">{p.protocol}</span><span className="tag">{clientLabel[p.client]}</span><span className="tag">P{p.priority}</span></div><dl><div><dt>认证</dt><dd><KeyRound size={14} />{p.apiKey ? `${p.apiKey.slice(0, 5)}••••••••` : "未配置"}</dd></div><div><dt>可用模型</dt><dd>{p.models.length ? `${p.models.length} 个` : "尚未获取"}</dd></div><div><dt>连续失败</dt><dd>{p.failures} 次</dd></div></dl><div className="card-actions"><button className="secondary" onClick={() => setEdit(p)}><Pencil size={15} />编辑</button><button className="danger-ghost" aria-label={`删除 ${p.name}`} onClick={async () => { if (confirm(`确定删除供应商「${p.name}」？`)) { await deleteProvider(p.id); await refresh(); notify("供应商已删除"); } }}><Trash2 size={16} /></button></div></article>)}</div>
-    {!data.providers.length && <Empty title="还没有供应商" text="添加第一个上游端点后即可开始路由。" action={<button className="primary" onClick={() => setEdit(blank())}>添加供应商</button>} />}
+  const [activeClient, setActiveClient] = useState<ClientKind>("codex");
+  const [providers, setProviders] = useState(data.providers);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const [savingOrder, setSavingOrder] = useState(false);
+  const [savingFailover, setSavingFailover] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [balances, setBalances] = useState<Record<string, { loading: boolean; info?: BalanceInfo; error?: string }>>({});
+  const balanceRequested = useRef(new Set<string>());
+  useEffect(() => setProviders(data.providers), [data.providers]);
+  const loadBalance = async (provider: Provider) => {
+    balanceRequested.current.add(provider.id);
+    setBalances(prev => ({ ...prev, [provider.id]: { loading: true, info: prev[provider.id]?.info } }));
+    try { const info = await fetchProviderBalance(provider); setBalances(prev => ({ ...prev, [provider.id]: { loading: false, info } })); }
+    catch (error) { setBalances(prev => ({ ...prev, [provider.id]: { loading: false, error: String(error) } })); }
+  };
+  useEffect(() => { for (const provider of providers) if (provider.balance?.kind && !balanceRequested.current.has(provider.id)) void loadBalance(provider); }, [providers]);
+  const visibleProviders = useMemo(() => providers.filter(provider => provider.client === activeClient || provider.client === "all").sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name)), [providers, activeClient]);
+  const queueNo = useMemo(() => { const map = new Map<string, number>(); let n = 0; for (const provider of visibleProviders) if (provider.enabled) map.set(provider.id, ++n); return map; }, [visibleProviders]);
+  const blank = (): Provider => ({ id: uid(), name: "", protocol: activeClient === "claude" ? "anthropic" : activeClient === "codex" ? "responses" : "openai", baseUrl: "https://", apiKey: "", enabled: true, priority: visibleProviders.length + 1, client: activeClient, health: "healthy", failures: 0, models: [], customUserAgent: "" });
+  const submit = async (p: Provider) => { await saveProvider(p); balanceRequested.current.delete(p.id); setEdit(null); await refresh(); notify("供应商已保存"); };
+  const reorder = async (sourceId: string, targetId: string) => {
+    if (sourceId === targetId) return;
+    const ordered = [...visibleProviders]; const from = ordered.findIndex(provider => provider.id === sourceId); const to = ordered.findIndex(provider => provider.id === targetId);
+    if (from < 0 || to < 0) return;
+    const [moved] = ordered.splice(from, 1); ordered.splice(to, 0, moved);
+    const visibleIds = new Set(ordered.map(provider => provider.id));
+    const globalOrder = [...ordered, ...providers.filter(provider => !visibleIds.has(provider.id)).sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))];
+    const priorities = new Map(globalOrder.map((provider, index) => [provider.id, index + 1]));
+    const next = providers.map(provider => priorities.has(provider.id) ? { ...provider, priority: priorities.get(provider.id)! } : provider);
+    setProviders(next); setDraggingId(null); setDropTargetId(null); setSavingOrder(true);
+    try { await Promise.all(next.map(provider => saveProvider(provider))); await refresh(); notify("供应商优先级已更新"); }
+    catch (error) { setProviders(data.providers); notify(`排序保存失败：${String(error)}`); }
+    finally { setSavingOrder(false); }
+  };
+  const startDrag = (event: DragEvent<HTMLButtonElement>, providerId: string) => { setDraggingId(providerId); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", providerId); };
+  const activeTab = providerTabs.find(tab => tab.id === activeClient)!;
+  const toggleFailover = async () => { const next = { ...data.config, autoFailover: { ...data.config.autoFailover, [activeClient]: !data.config.autoFailover[activeClient] } }; setSavingFailover(true); try { await onConfig(next); notify(next.autoFailover[activeClient] ? `${activeTab.label} 故障转移已开启` : `${activeTab.label} 故障转移已关闭`); } catch (error) { notify(`故障转移保存失败：${String(error)}`); } finally { setSavingFailover(false); } };
+  const toggleEnabled = async (provider: Provider) => { setBusyId(provider.id); try { await saveProvider({ ...provider, enabled: !provider.enabled }); await refresh(); notify(provider.enabled ? `「${provider.name}」已停用，退出路由队列` : `「${provider.name}」已加入路由队列`); } catch (error) { notify(`保存失败：${String(error)}`); } finally { setBusyId(null); } };
+  const duplicate = async (provider: Provider) => { setBusyId(provider.id); try { await saveProvider({ ...provider, id: uid(), name: `${provider.name} 副本`, priority: providers.length + 1, failures: 0, health: "healthy" }); await refresh(); notify("已复制供应商，排在队列末尾"); } catch (error) { notify(`复制失败：${String(error)}`); } finally { setBusyId(null); } };
+  return <div className="page-stack"><SectionHead eyebrow="UPSTREAMS" title="供应商" text="按客户端管理上游端点；卡片顺序就是实际路由优先级" action={<button className="primary green" onClick={() => setEdit(blank())}><Plus size={17} />添加供应商</button>} />
+    <div className="provider-bar">
+      <div className="client-switch" role="tablist" aria-label="供应商类型">{providerTabs.map(tab => { const Icon = tabIcon[tab.id]; const count = providers.filter(provider => provider.client === tab.id || provider.client === "all").length; return <button role="tab" aria-selected={activeClient === tab.id} className={activeClient === tab.id ? "active" : ""} key={tab.id} onClick={() => setActiveClient(tab.id)}><Icon size={16} /><span>{tab.label}</span><small>{count}</small></button> })}</div>
+      <div className="failover-pill"><span><b>故障转移</b><small>{savingFailover ? "正在保存设置…" : data.config.autoFailover[activeClient] ? "失败时自动尝试下一供应商" : "失败后立即返回错误"}</small></span><label className="switch" title="切换故障转移"><input type="checkbox" disabled={savingFailover} checked={data.config.autoFailover[activeClient]} onChange={() => void toggleFailover()} /><span /></label></div>
+    </div>
+    <div className="queue-hint" aria-live="polite"><GripVertical size={13} /><span>{savingOrder ? "正在保存新的优先级顺序…" : <>拖拽卡片调整 P1、P2 优先级；通用供应商会出现在所有队列 · <code>{activeTab.endpoint}</code></>}</span></div>
+    <div className="provider-cards" role="list" aria-label={`${activeTab.label} 供应商优先级列表`}>{visibleProviders.map(provider => { const queue = queueNo.get(provider.id); const busy = busyId === provider.id; return <article role="listitem" className={`provider-card${provider.enabled ? " joined" : " off"}${draggingId === provider.id ? " dragging" : ""}${dropTargetId === provider.id ? " drop-target" : ""}`} key={provider.id} onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; if (draggingId !== provider.id) setDropTargetId(provider.id); }} onDragLeave={() => setDropTargetId(current => current === provider.id ? null : current)} onDrop={event => { event.preventDefault(); const sourceId = draggingId ?? event.dataTransfer.getData("text/plain"); void reorder(sourceId, provider.id); }}>
+      <button className="drag-handle" draggable={!savingOrder} disabled={savingOrder} aria-label={`拖拽调整 ${provider.name} 优先级`} onDragStart={event => startDrag(event, provider.id)} onDragEnd={() => { setDraggingId(null); setDropTargetId(null); }}><GripVertical size={17} /></button>
+      <div className="provider-avatar round" style={avatarStyle(provider.name)} aria-hidden="true">{initials(provider.name)}</div>
+      <div className="card-main">
+        <div className="card-title"><h3>{provider.name}</h3><Health status={provider.health} />{queue !== undefined && <span className="qtag">P{queue}</span>}{provider.client === "all" && <span className="tag shared">通用</span>}</div>
+        <div className="card-sub"><code className="card-url">{provider.baseUrl}</code><span className="sep" /><span>{protocolLabel[provider.protocol]}</span><span className="sep" /><span>{provider.models.length ? `${provider.models.length} 个模型` : "未获取模型"}</span>{provider.balance?.kind && (() => { const balance = balances[provider.id]; return <><span className="sep" /><button type="button" className={`balance-chip${balance?.error ? " error" : ""}`} title={balance?.error ? `${balance.error}（点击重试）` : balance?.info ? `总额 $${balance.info.total.toFixed(2)} · 已用 $${balance.info.used.toFixed(2)}（点击刷新）` : "点击刷新余额"} onClick={() => void loadBalance(provider)}><Wallet size={12} />{balance?.loading ? "查询中…" : balance?.info ? `余额 $${balance.info.remaining.toFixed(2)}` : balance?.error ? "余额获取失败" : "查询余额"}</button></> })()}{provider.failures > 0 && <><span className="sep" /><span className="fail-note">{provider.failures} 次连续失败</span></>}</div>
+      </div>
+      <div className="card-side">
+        <button className={`join-btn${provider.enabled ? " on" : ""}`} disabled={busy || savingOrder} title={provider.enabled ? "点击停用，退出路由队列" : "点击启用，加入路由队列"} onClick={() => void toggleEnabled(provider)}>{provider.enabled ? <><Check size={15} />已启用</> : <><Power size={13} />已停用</>}</button>
+        <div className="card-tools">
+          <button className="icon-btn tiny" disabled={savingOrder || busy} aria-label={`编辑 ${provider.name}`} onClick={() => setEdit(provider)}><Pencil size={14} /></button>
+          <button className="icon-btn tiny" disabled={savingOrder || busy} aria-label={`复制 ${provider.name}`} onClick={() => void duplicate(provider)}><CopyPlus size={14} /></button>
+          <button className="icon-btn tiny danger" disabled={savingOrder || busy} aria-label={`删除 ${provider.name}`} onClick={async () => { if (confirm(`确定删除供应商「${provider.name}」？`)) { await deleteProvider(provider.id); await refresh(); notify("供应商已删除"); } }}><Trash2 size={14} /></button>
+        </div>
+      </div>
+    </article> })}</div>
+    {!visibleProviders.length && <Empty title={`还没有 ${activeTab.label} 供应商`} text="添加第一个上游端点后，它会自动成为 P1。" action={<button className="primary green" onClick={() => setEdit(blank())}>添加供应商</button>} />}
     {edit && <ProviderModal value={edit} onClose={() => setEdit(null)} onSave={submit} />}
   </div>;
 }
 
 function ProviderModal({ value, onClose, onSave }: { value: Provider; onClose: () => void; onSave: (p: Provider) => void }) {
   const [p, setP] = useState(value); const patch = (x: Partial<Provider>) => setP({ ...p, ...x });
+  const balance = p.balance ?? { kind: "", baseUrl: "", token: "", userId: "" };
+  const patchBalance = (x: Partial<BalanceQuery>) => patch({ balance: { ...balance, ...x } });
   const [fetching, setFetching] = useState(false); const [fetchError, setFetchError] = useState(""); const [modelQuery, setModelQuery] = useState("");
   const visibleModels = p.models.filter(model => model.toLowerCase().includes(modelQuery.toLowerCase())).slice(0, 80);
   const fetchModels = async () => { setFetching(true); setFetchError(""); try { patch({ models: await fetchProviderModels(p) }); } catch (error) { setFetchError(String(error)); } finally { setFetching(false); } };
-  return <Modal title={value.name ? "编辑供应商" : "添加供应商"} subtitle="密钥仅保存在本机，不会同步到任何云端。" onClose={onClose}><form onSubmit={e => { e.preventDefault(); void onSave(p); }}><div className="form-grid two"><Field label="供应商名称" required><input required value={p.name} onChange={e => patch({ name: e.target.value })} placeholder="例如 OpenRouter" /></Field><Field label="目标客户端"><select value={p.client} onChange={e => patch({ client: e.target.value as Provider["client"] })}><option value="all">全部客户端</option><option value="codex">Codex</option><option value="claude">Claude</option><option value="openai">OpenAI 兼容</option></select></Field><Field label="上游协议"><select value={p.protocol} onChange={e => patch({ protocol: e.target.value as Provider["protocol"] })}><option value="openai">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option></select></Field><Field label="优先级"><input type="number" min="1" value={p.priority} onChange={e => patch({ priority: +e.target.value })} /></Field></div><Field label="Base URL" required hint="填写服务根地址，模型发现会自动请求 /models 或 /v1/models。"><input required type="url" value={p.baseUrl} onChange={e => patch({ baseUrl: e.target.value.replace(/\/$/, "") })} placeholder="https://api.example.com/v1" /></Field><Field label="API Key" hint="用于路由和模型发现请求。"><input type="password" autoComplete="off" value={p.apiKey} onChange={e => patch({ apiKey: e.target.value })} placeholder="sk-..." /></Field><Field label="自定义 User-Agent" hint="可选。仅当供应商明确要求客户端指纹时填写；留空会保留原客户端 UA，不会伪装浏览器。"><input value={p.customUserAgent ?? ""} onChange={e => patch({ customUserAgent: e.target.value })} placeholder="例如 claude-cli/1.0.119 (external, cli)" /></Field><section className="model-discovery" aria-labelledby="model-discovery-title"><div className="model-discovery-head"><div><b id="model-discovery-title">可用模型</b><small>{p.models.length ? `已获取 ${p.models.length} 个模型` : "从供应商读取模型列表"}</small></div><button type="button" className="secondary" disabled={fetching || !p.baseUrl || p.baseUrl === "https://"} onClick={() => void fetchModels()}><RefreshCw size={15} className={fetching ? "spin" : ""} />{fetching ? "正在获取" : p.models.length ? "重新获取" : "获取模型"}</button></div>{fetchError && <div className="inline-error" role="alert"><TriangleAlert size={15} /><span>{fetchError}</span><button type="button" onClick={() => void fetchModels()}>重试</button></div>}{p.models.length > 0 && <><div className="model-search"><Search size={15} /><input aria-label="搜索已获取模型" value={modelQuery} onChange={e => setModelQuery(e.target.value)} placeholder="搜索模型 ID" /><span>{visibleModels.length}/{p.models.length}</span></div><div className="discovered-models" role="list" aria-label="供应商模型列表">{visibleModels.map(model => <button type="button" role="listitem" key={model} title="复制模型 ID" onClick={() => void navigator.clipboard.writeText(model)}><Layers3 size={13} /><code>{model}</code><Copy size={13} /></button>)}</div>{p.models.length > 80 && !modelQuery && <small className="model-limit">当前显示前 80 项，可通过搜索定位其他模型。</small>}</>}</section><label className="check-row"><input type="checkbox" checked={p.enabled} onChange={() => patch({ enabled: !p.enabled })} /><span><b>加入路由</b><small>允许网关向此供应商转发请求</small></span></label><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={!p.name || !p.baseUrl}>保存供应商</button></div></form></Modal>;
+  return <Modal title={value.name ? "编辑供应商" : "添加供应商"} subtitle="密钥仅保存在本机；保存后立即按当前排序加入对应路由队列。" onClose={onClose}><form onSubmit={e => { e.preventDefault(); void onSave(p); }}>
+    <div className="modal-preview" aria-hidden="true"><div className="provider-avatar round" style={avatarStyle(p.name || "?")}>{initials(p.name)}</div><div className="modal-preview-text"><b>{p.name || "新供应商"}</b><code>{!p.baseUrl || p.baseUrl === "https://" ? "在下方填写连接信息" : p.baseUrl}</code></div><span className={`join-btn static${p.enabled ? " on" : ""}`}>{p.enabled ? <><Check size={14} />启用</> : <><Power size={13} />停用</>}</span></div>
+    <section className="form-section"><div className="form-section-head"><b>基本信息</b><small>名称、所属客户端与上游协议</small></div><div className="form-grid two"><Field label="供应商名称" required><input required value={p.name} onChange={e => patch({ name: e.target.value })} placeholder="例如 OpenRouter" /></Field><Field label="供应商类型"><select value={p.client} onChange={e => patch({ client: e.target.value as Provider["client"] })}><option value="codex">Codex</option><option value="claude">Claude</option><option value="openai">OpenAI 兼容</option><option value="all">通用供应商</option></select></Field><Field label="上游协议"><select value={p.protocol} onChange={e => patch({ protocol: e.target.value as Provider["protocol"] })}><option value="openai">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option></select></Field><Field label="启用状态" hint="停用后保留配置，但不参与路由。"><label className="switch-field"><span>{p.enabled ? "已加入路由队列" : "已停用"}</span><label className="switch small"><input type="checkbox" checked={p.enabled} onChange={() => patch({ enabled: !p.enabled })} /><span /></label></label></Field></div></section>
+    <section className="form-section"><div className="form-section-head"><b>连接与密钥</b><small>密钥仅存储在本机 SQLite 数据库</small></div><Field label="Base URL" required hint="填写服务根地址，模型发现会自动请求 /models 或 /v1/models。"><input required type="url" value={p.baseUrl} onChange={e => patch({ baseUrl: e.target.value.replace(/\/$/, "") })} placeholder="https://api.example.com/v1" /></Field><div className="form-grid two"><Field label="API Key" hint="用于路由和模型发现请求。"><input type="password" autoComplete="off" value={p.apiKey} onChange={e => patch({ apiKey: e.target.value })} placeholder="sk-..." /></Field><Field label="自定义 User-Agent" hint="可选。仅当供应商明确要求客户端指纹时填写；留空保留原客户端 UA。"><input value={p.customUserAgent ?? ""} onChange={e => patch({ customUserAgent: e.target.value })} placeholder="例如 claude-cli/1.0.119 (external, cli)" /></Field><Field label="余额查询" hint="供应商控制台支持时可在卡片上显示剩余额度。"><select value={balance.kind} onChange={e => patchBalance({ kind: e.target.value })}><option value="">不查询</option><option value="newapi">NewAPI / one-api 协议</option></select></Field></div>{balance.kind === "newapi" && <div className="form-grid two"><Field label="控制台地址" hint="留空则使用供应商地址自动推导根路径。"><input value={balance.baseUrl} onChange={e => patchBalance({ baseUrl: e.target.value })} placeholder="https://api.newapi.com" /></Field><Field label="访问令牌" required hint="在控制台「个人设置 → 安全设置」中生成，不是 sk- 密钥。"><input required type="password" autoComplete="off" value={balance.token} onChange={e => patchBalance({ token: e.target.value })} placeholder="在'安全设置'里生成" /></Field><Field label="用户 ID" required hint="控制台个人信息页的数字 ID。"><input required value={balance.userId} onChange={e => patchBalance({ userId: e.target.value })} placeholder="例如：114514" /></Field></div>}</section>
+    <section className="form-section model-discovery" aria-labelledby="model-discovery-title"><div className="model-discovery-head"><div><b id="model-discovery-title">可用模型</b><small>{p.models.length ? `已获取 ${p.models.length} 个模型` : "从供应商读取模型列表"}</small></div><button type="button" className="secondary" disabled={fetching || !p.baseUrl || p.baseUrl === "https://"} onClick={() => void fetchModels()}><RefreshCw size={15} className={fetching ? "spin" : ""} />{fetching ? "正在获取" : p.models.length ? "重新获取" : "获取模型"}</button></div>{fetchError && <div className="inline-error" role="alert"><TriangleAlert size={15} /><span>{fetchError}</span><button type="button" onClick={() => void fetchModels()}>重试</button></div>}{p.models.length > 0 && <><div className="model-search"><Search size={15} /><input aria-label="搜索已获取模型" value={modelQuery} onChange={e => setModelQuery(e.target.value)} placeholder="搜索模型 ID" /><span>{visibleModels.length}/{p.models.length}</span></div><div className="discovered-models" role="list" aria-label="供应商模型列表">{visibleModels.map(model => <button type="button" role="listitem" key={model} title="复制模型 ID" onClick={() => void navigator.clipboard.writeText(model)}><Layers3 size={13} /><code>{model}</code><Copy size={13} /></button>)}</div>{p.models.length > 80 && !modelQuery && <small className="model-limit">当前显示前 80 项，可通过搜索定位其他模型。</small>}</>}</section>
+    <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary green" disabled={!p.name || !p.baseUrl}>保存供应商</button></div></form></Modal>;
 }
 
 function Models({ data, refresh, notify }: { data: DashboardData; refresh: () => Promise<void>; notify: (s: string) => void }) {
@@ -165,7 +240,7 @@ function Usage({ data, filter, updateFilter }: { data: DashboardData; filter: Us
   return <div className="page-stack"><SectionHead eyebrow="OBSERVABILITY" title="使用统计" text="筛选会同步驱动全部指标、趋势与明细" /><Filters data={data} filter={filter} update={updateFilter} />
     <section className="usage-hero"><div><span className="eyebrow">TRUE CONSUMPTION</span><strong>{fmt(data.summary.tokens)}</strong><p>真实消耗 Tokens</p></div><div className="usage-metrics"><div><span>请求数</span><b>{fmt(data.summary.requests)}</b></div><div><span>缓存命中率</span><b>{data.summary.cacheHitRate.toFixed(1)}%</b></div><div><span>预估费用</span><b>{money(data.summary.cost)}</b></div><div><span>成功率</span><b>{data.summary.successRate.toFixed(1)}%</b></div></div></section>
     <section className="panel chart-panel"><SectionHead eyebrow="TOKEN TREND" title="Token 与费用趋势" text="输入、输出和缓存读取（千 Tokens）" /><UsageChart data={data.trend} /></section>
-    <section className="panel table-panel"><div className="tab-head"><div className="segmented"><button className={tab === "providers" ? "active" : ""} onClick={() => setTab("providers")}>供应商统计</button><button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}>模型统计</button></div><button className="secondary"><ArrowDown size={15} />导出 CSV</button></div><StatsTable rows={tab === "providers" ? data.providerStats : data.modelStats} /></section>
+    <section className="panel table-panel"><div className="tab-head"><div className="segmented"><button className={tab === "providers" ? "active" : ""} onClick={() => setTab("providers")}>供应商统计</button><button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}>模型统计</button></div></div><StatsTable rows={tab === "providers" ? data.providerStats : data.modelStats} /></section>
   </div>;
 }
 
@@ -175,11 +250,114 @@ function Logs({ data, filter, updateFilter }: { data: DashboardData; filter: Usa
   return <div className="page-stack"><SectionHead eyebrow="REQUEST TRACE" title="请求日志" text="检查路由决策、Token、延迟和故障转移事件" action={<button className="secondary" onClick={() => setQuery("")}><RotateCcw size={15} />重置</button>} /><div className="filter-bar"><div className="search-box"><Search size={16} /><input aria-label="搜索日志" value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索供应商、模型或状态码" /></div><select aria-label="客户端筛选" value={filter.client} onChange={e => updateFilter({ ...filter, client: e.target.value as UsageFilter["client"] })}><option value="all">全部客户端</option><option value="codex">Codex</option><option value="claude">Claude</option><option value="openai">OpenAI 兼容</option></select><select aria-label="日期范围" value={filter.range} onChange={e => updateFilter({ ...filter, range: e.target.value as UsageFilter["range"] })}><option value="today">今天</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select></div><section className="panel table-panel"><LogTable logs={logs} /></section></div>;
 }
 
-function SettingsPage({ data, onChange, onSeed }: { data: DashboardData; onChange: (c: GatewayConfig) => void; onSeed: () => void }) {
+const fmtBytes = (n: number) => n >= 1_048_576 ? `${(n / 1_048_576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+
+/** 需要重启才能生效的操作统一走这里：确认后立即重启，否则提示下次启动生效。 */
+async function restartFlow(message: string, notify: (s: string) => void) {
+  if (confirm(`${message}\n\n现在重启应用生效吗？`)) await restartApp();
+  else notify("已暂存，下次启动应用时生效");
+}
+
+function SettingsPage({ data, notify, onChange }: { data: DashboardData; notify: (s: string) => void; onChange: (c: GatewayConfig) => void }) {
   const [c, setC] = useState(data.config);
   const update = (x: Partial<GatewayConfig>) => setC({ ...c, ...x });
   const updateRectifier = (x: Partial<GatewayConfig["rectifier"]>) => update({ rectifier: { ...c.rectifier, ...x } });
-  return <div className="page-stack"><SectionHead eyebrow="PREFERENCES" title="网关设置" text="配置监听地址、请求整流与本地数据" /><section className="panel settings-form"><SectionHead eyebrow="NETWORK" title="监听与代理" text="修改地址或端口后需要重启应用" /><div className="form-grid two"><Field label="监听地址"><input value={c.host} onChange={e => update({ host: e.target.value })} /></Field><Field label="端口"><input type="number" min="1024" max="65535" value={c.port} onChange={e => update({ port: +e.target.value })} /></Field></div><Field label="全局出站代理" hint="可选，支持 http:// 与 socks5://。"><input value={c.outboundProxy} onChange={e => update({ outboundProxy: e.target.value })} placeholder="http://127.0.0.1:7890" /></Field></section><section className="panel rectifier-panel"><div className="rectifier-head"><div className="rectifier-icon"><Zap size={18} /></div><div><span className="eyebrow">REQUEST RECTIFIER</span><h3>整流器</h3><p>自动修复不同客户端与上游 API 之间的请求兼容问题。</p></div><SettingSwitch label="启用整流器" checked={c.rectifier.enabled} onChange={enabled => updateRectifier({ enabled })} /></div><div className={c.rectifier.enabled ? "rectifier-options" : "rectifier-options disabled"} aria-disabled={!c.rectifier.enabled}><SettingRow title="Thinking / 签名整流" text="上游拒绝 thinking、reasoning 或签名字段时，清理不兼容内容并在同一供应商重试一次。" checked={c.rectifier.thinkingSignature} disabled={!c.rectifier.enabled} onChange={thinkingSignature => updateRectifier({ thinkingSignature })} /><SettingRow title="Thinking Budget 整流" text="遇到 Anthropic budget_tokens 最小值约束时，将 budget 调整为 32000，并在需要时把 max_tokens 调整为 64000。" checked={c.rectifier.thinkingBudget} disabled={!c.rectifier.enabled} onChange={thinkingBudget => updateRectifier({ thinkingBudget })} /><SettingRow title="不支持图片降级" text="上游拒绝图片输入时，把图片块替换为 [Unsupported Image]，避免会话直接中断。" checked={c.rectifier.mediaFallback} disabled={!c.rectifier.enabled} onChange={mediaFallback => updateRectifier({ mediaFallback })} /><SettingRow title="纯文本模型预检" text="对已确认的纯文本模型在发送前降级图片；关闭后仍保留上游报错后的图片兜底。" checked={c.rectifier.textOnlyPreflight} disabled={!c.rectifier.enabled || !c.rectifier.mediaFallback} onChange={textOnlyPreflight => updateRectifier({ textOnlyPreflight })} /></div></section><div className="settings-save"><span>整流配置保存后立即作用于新请求，无需重启网关。</span><button className="primary" onClick={() => void onChange(c)}>保存设置</button></div><section className="panel danger-zone"><div><span className="eyebrow">DEVELOPER</span><h3>写入示例统计</h3><p>向本地数据库添加一组脱敏请求，用于检查统计图表。</p></div><button className="secondary" onClick={onSeed}>生成示例数据</button></section><section className="about-card"><div className="brand-mark"><Zap /></div><div><h3>FluxGate 0.1.0</h3><p>Tauri + Rust 驱动的本地 AI 网关</p></div><span>数据目录由系统应用目录托管</span></section></div>;
+  const webdav = c.webdav ?? { url: "", username: "", password: "", remoteDir: "fluxgate" };
+  const updateWebdav = (x: Partial<WebdavConfig>) => update({ webdav: { ...webdav, ...x } });
+  const [syncBusy, setSyncBusy] = useState("");
+  const runSync = async (task: string, action: () => Promise<string>) => {
+    setSyncBusy(task);
+    try { notify(await action()); }
+    catch (error) { notify(`${task}失败：${String(error)}`); }
+    finally { setSyncBusy(""); }
+  };
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [pendingUpdate, setPendingUpdate] = useState<UpdateInfo | null>(null);
+  const checkForUpdate = async () => {
+    setUpdateBusy(true);
+    try { const info = await checkUpdate(); setPendingUpdate(info); notify(info ? `发现新版本 v${info.version}` : "当前已是最新版本"); }
+    catch (error) { notify(`检查更新失败：${String(error)}`); }
+    finally { setUpdateBusy(false); }
+  };
+  const applyUpdate = async () => {
+    setUpdateBusy(true);
+    try { notify("正在下载并安装更新，完成后会自动重启…"); await installUpdate(); }
+    catch (error) { notify(`更新失败：${String(error)}`); setUpdateBusy(false); }
+  };
+  const save = async () => {
+    const listenChanged = c.host !== data.config.host || c.port !== data.config.port;
+    await onChange(c);
+    if (listenChanged) await restartFlow(`监听地址已改为 ${c.host}:${c.port}，网关需要重启才会在新地址上监听。`, notify);
+  };
+  return <div className="page-stack"><SectionHead eyebrow="PREFERENCES" title="网关设置" text="配置监听地址、请求整流与本地数据" /><section className="panel settings-form"><SectionHead eyebrow="NETWORK" title="监听与代理" text="修改地址或端口后，保存时会提示一键重启生效" /><div className="form-grid two"><Field label="监听地址"><input value={c.host} onChange={e => update({ host: e.target.value })} /></Field><Field label="端口"><input type="number" min="1024" max="65535" value={c.port} onChange={e => update({ port: +e.target.value })} /></Field></div><Field label="全局出站代理" hint="可选，支持 http:// 与 socks5://。"><input value={c.outboundProxy} onChange={e => update({ outboundProxy: e.target.value })} placeholder="http://127.0.0.1:7890" /></Field></section><section className="panel"><SectionHead eyebrow="DESKTOP" title="桌面驻留" text="让网关常驻后台，避免关闭窗口后服务中断" /><div className="rectifier-options"><SettingRow title="关闭窗口时最小化到托盘" text="点击关闭按钮后隐藏到系统托盘，网关继续在后台提供服务；从托盘菜单可退出。" checked={c.minimizeToTray} disabled={false} onChange={minimizeToTray => update({ minimizeToTray })} /><SettingRow title="开机自动启动" text="登录系统后自动启动 FluxGate，保存设置后立即生效。" checked={c.launchAtLogin} disabled={false} onChange={launchAtLogin => update({ launchAtLogin })} /></div></section><section className="panel rectifier-panel"><div className="rectifier-head"><div className="rectifier-icon"><Zap size={18} /></div><div><span className="eyebrow">REQUEST RECTIFIER</span><h3>整流器</h3><p>自动修复不同客户端与上游 API 之间的请求兼容问题。</p></div><SettingSwitch label="启用整流器" checked={c.rectifier.enabled} onChange={enabled => updateRectifier({ enabled })} /></div><div className={c.rectifier.enabled ? "rectifier-options" : "rectifier-options disabled"} aria-disabled={!c.rectifier.enabled}><SettingRow title="Thinking / 签名整流" text="上游拒绝 thinking、reasoning 或签名字段时，清理不兼容内容并在同一供应商重试一次。" checked={c.rectifier.thinkingSignature} disabled={!c.rectifier.enabled} onChange={thinkingSignature => updateRectifier({ thinkingSignature })} /><SettingRow title="Thinking Budget 整流" text="遇到 Anthropic budget_tokens 最小值约束时，将 budget 调整为 32000，并在需要时把 max_tokens 调整为 64000。" checked={c.rectifier.thinkingBudget} disabled={!c.rectifier.enabled} onChange={thinkingBudget => updateRectifier({ thinkingBudget })} /><SettingRow title="不支持图片降级" text="上游拒绝图片输入时，把图片块替换为 [Unsupported Image]，避免会话直接中断。" checked={c.rectifier.mediaFallback} disabled={!c.rectifier.enabled} onChange={mediaFallback => updateRectifier({ mediaFallback })} /><SettingRow title="纯文本模型预检" text="对已确认的纯文本模型在发送前降级图片；关闭后仍保留上游报错后的图片兜底。" checked={c.rectifier.textOnlyPreflight} disabled={!c.rectifier.enabled || !c.rectifier.mediaFallback} onChange={textOnlyPreflight => updateRectifier({ textOnlyPreflight })} /></div></section><section className="panel"><SectionHead eyebrow="PROMPT CACHE" title="Prompt 缓存注入" text="降低 Anthropic 协议上游的重复输入费用" /><div className="rectifier-options"><SettingRow title="自动注入缓存断点" text="给发往 Anthropic 协议上游的请求自动标记 cache_control（工具列表、系统提示与最新消息，最多 4 处，保留调用方已有标记），让未主动使用缓存的客户端也能命中 Prompt Cache。" checked={c.cacheInjection} disabled={false} onChange={cacheInjection => update({ cacheInjection })} /></div></section>
+    <section className="panel"><SectionHead eyebrow="CLOUD SYNC" title="云同步" text="通过 WebDAV 在多设备间同步数据库快照；凭证仅保存在本机" />
+      <div className="form-grid two"><Field label="服务器地址"><input value={webdav.url} onChange={e => updateWebdav({ url: e.target.value })} placeholder="https://dav.jianguoyun.com/dav" /></Field><Field label="远程目录"><input value={webdav.remoteDir} onChange={e => updateWebdav({ remoteDir: e.target.value })} placeholder="fluxgate" /></Field><Field label="用户名"><input value={webdav.username} onChange={e => updateWebdav({ username: e.target.value })} autoComplete="off" /></Field><Field label="密码" hint="坚果云等服务请使用应用专用密码。"><input type="password" value={webdav.password} onChange={e => updateWebdav({ password: e.target.value })} autoComplete="off" /></Field></div>
+      <div className="panel-actions">
+        <button className="secondary" disabled={!!syncBusy} onClick={() => void runSync("测试连接", async () => { await webdavTest(webdav); return "WebDAV 连接正常"; })}>{syncBusy === "测试连接" ? "正在测试…" : "测试连接"}</button>
+        <button className="secondary" disabled={!!syncBusy} onClick={() => void runSync("上传", async () => { const report = await webdavUpload(webdav); return `已上传 ${fmtBytes(report.sizeBytes)} 到云端`; })}><CloudUpload size={15} />{syncBusy === "上传" ? "正在上传…" : "上传到云端"}</button>
+        <button className="secondary" disabled={!!syncBusy} onClick={() => { if (!confirm("将用云端快照覆盖本地数据（当前数据会自动备份一份）。继续？")) return; void runSync("恢复", async () => { const report = await webdavDownload(webdav); void restartFlow(`已下载 ${fmtBytes(report.sizeBytes)}，恢复会在重启后完成。`, notify); return "云端快照已暂存"; }); }}><CloudDownload size={15} />{syncBusy === "恢复" ? "正在下载…" : "从云端恢复"}</button>
+      </div>
+      <small className="panel-note">云同步配置随「保存设置」一起持久化；上传的是完整数据库快照（含供应商密钥），请使用可信的私有 WebDAV。</small>
+    </section><div className="settings-save"><span>整流配置保存后立即作用于新请求，无需重启网关。</span><button className="primary" onClick={() => void save()}>保存设置</button></div>
+    <StoragePanel notify={notify} />
+    <BackupPanel notify={notify} />
+    <section className="about-card"><div className="brand-mark"><Zap /></div><div><h3>FluxGate 0.0.1</h3><p>Tauri + Rust 驱动的本地 AI 网关</p></div>{pendingUpdate ? <button className="primary" disabled={updateBusy} onClick={() => void applyUpdate()}>{updateBusy ? "正在更新…" : `更新到 v${pendingUpdate.version}`}</button> : <button className="secondary" disabled={updateBusy} onClick={() => void checkForUpdate()}><RefreshCw size={15} className={updateBusy ? "spin" : ""} />{updateBusy ? "正在检查…" : "检查更新"}</button>}</section></div>;
+}
+
+function StoragePanel({ notify }: { notify: (s: string) => void }) {
+  const [info, setInfo] = useState<StorageInfo | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => { try { setInfo(await getStorageInfo()); } catch { /* demo 环境忽略 */ } };
+  useEffect(() => { void load(); }, []);
+  const choose = async () => {
+    setBusy(true);
+    try {
+      const dir = await chooseDirectory();
+      if (!dir) return;
+      await setDataDirectory(dir);
+      await load();
+      await restartFlow(`数据目录将迁移到：\n${dir}\n（数据库已复制过去，原数据保留在旧目录）`, notify);
+    } catch (error) { notify(`更改目录失败：${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  const reset = async () => {
+    if (!confirm("恢复到系统默认数据目录？")) return;
+    setBusy(true);
+    try { await resetDataDirectory(); await load(); await restartFlow("已恢复默认数据目录。", notify); }
+    catch (error) { notify(`恢复失败：${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  return <section className="panel"><SectionHead eyebrow="DATA DIRECTORY" title="数据目录" text="数据库与备份的存放位置；指向云盘或 NAS 目录即可多设备共享，更改后需重启" />
+    {info && <div className="storage-row"><HardDrive size={16} /><code>{info.dataDir}</code>{info.isCustom && <span className="tag shared">自定义</span>}<span className="storage-size">{fmtBytes(info.dbSizeBytes)}</span></div>}
+    <div className="panel-actions">
+      <button className="secondary" disabled={busy} onClick={() => void choose()}><FolderOpen size={15} />选择新目录…</button>
+      <button className="secondary" disabled={busy} onClick={() => void openDataDirectory()}>打开当前目录</button>
+      {info?.isCustom && <button className="secondary" disabled={busy} onClick={() => void reset()}><RotateCcw size={14} />恢复默认位置</button>}
+    </div>
+  </section>;
+}
+
+function BackupPanel({ notify }: { notify: (s: string) => void }) {
+  const [backups, setBackups] = useState<BackupEntry[]>([]);
+  const [busy, setBusy] = useState(false);
+  const load = async () => { try { setBackups(await backupList()); } catch { /* demo 环境忽略 */ } };
+  useEffect(() => { void load(); }, []);
+  const run = async (action: () => Promise<string | void>) => {
+    setBusy(true);
+    try { const message = await action(); await load(); if (message) notify(message); }
+    catch (error) { notify(`操作失败：${String(error)}`); }
+    finally { setBusy(false); }
+  };
+  return <section className="panel"><SectionHead eyebrow="BACKUP" title="备份与恢复" text="每次启动自动保留最近 10 份快照；恢复在重启时完成，恢复前会自动再备份一份" action={<button className="secondary" disabled={busy} onClick={() => void run(async () => { const entry = await backupNow(); return `已创建备份 ${entry.fileName}`; })}><Archive size={15} />立即备份</button>} />
+    {backups.length > 0 ? <div className="backup-list">{backups.map(backup => <div className="backup-row" key={backup.fileName}>
+      <Database size={15} />
+      <div className="backup-meta"><b>{backup.fileName}</b><small>{new Date(backup.createdMs).toLocaleString()} · {fmtBytes(backup.sizeBytes)}</small></div>
+      <div className="row-actions">
+        <button className="icon-btn" aria-label={`恢复 ${backup.fileName}`} title="恢复此备份" disabled={busy} onClick={() => { if (!confirm(`用「${backup.fileName}」覆盖当前数据？\n当前数据会自动备份一份，恢复在重启后完成。`)) return; void run(async () => { await backupRestore(backup.fileName); void restartFlow("备份已暂存。", notify); }); }}><RotateCcw size={15} /></button>
+        <button className="icon-btn danger" aria-label={`删除 ${backup.fileName}`} disabled={busy} onClick={() => void run(async () => { await backupDelete(backup.fileName); return "备份已删除"; })}><Trash2 size={15} /></button>
+      </div>
+    </div>)}</div> : <p className="backup-empty">还没有备份，点击右上角「立即备份」创建第一份。</p>}
+  </section>;
 }
 
 function SettingSwitch({ label, checked, disabled = false, onChange }: { label: string; checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {

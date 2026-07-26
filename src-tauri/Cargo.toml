@@ -1,6 +1,6 @@
 [package]
 name = "fluxgate"
-version = "0.1.0"
+version = "0.0.1"
 description = "A local-first AI gateway for Codex, Claude and OpenAI-compatible clients"
 authors = ["FluxGate Contributors"]
 edition = "2021"
@@ -24,7 +24,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }

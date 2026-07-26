@@ -1,10 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DashboardData, GatewayConfig, ModelAlias, Provider, UsageFilter } from "../types";
+import type { BackupEntry, BalanceInfo, DashboardData, GatewayConfig, ModelAlias, Provider, StorageInfo, SyncReport, UpdateInfo, UsageFilter, WebdavConfig } from "../types";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
 const demo: DashboardData = {
-  config: { enabled: true, host: "127.0.0.1", port: 18080, recordUsage: true, outboundProxy: "", clients: { codex: true, claude: true, openai: true }, autoFailover: { codex: true, claude: true, openai: false }, failureThreshold: 4, recoverySeconds: 60, maxRetries: 3, rectifier: { enabled: true, thinkingSignature: true, thinkingBudget: true, mediaFallback: true, textOnlyPreflight: true } },
+  config: { enabled: true, host: "127.0.0.1", port: 18080, recordUsage: true, outboundProxy: "", clients: { codex: true, claude: true, openai: true }, autoFailover: { codex: true, claude: true, openai: false }, failureThreshold: 4, recoverySeconds: 60, maxRetries: 3, rectifier: { enabled: true, thinkingSignature: true, thinkingBudget: true, mediaFallback: true, textOnlyPreflight: true }, cacheInjection: true, minimizeToTray: true, launchAtLogin: false, webdav: { url: "", username: "", password: "", remoteDir: "fluxgate" } },
   providers: [
     { id: "openai-main", name: "OpenAI Primary", protocol: "responses", baseUrl: "https://api.openai.com/v1", apiKey: "sk-••••••••••••", enabled: true, priority: 1, client: "codex", health: "healthy", failures: 0, models: ["gpt-5.2-codex", "gpt-5.2", "gpt-5.1"] },
     { id: "anthropic-main", name: "Anthropic Direct", protocol: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: "sk-ant-••••••••", enabled: true, priority: 1, client: "claude", health: "healthy", failures: 0, models: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"] },
@@ -38,14 +38,30 @@ const demo: DashboardData = {
 };
 
 export async function getDashboard(filter: UsageFilter): Promise<DashboardData> {
-  if (!isTauri()) return Promise.resolve(demo);
+  if (!isTauri()) return Promise.resolve({ ...demo, providers: [...demo.providers], aliases: [...demo.aliases] });
   return invoke("get_dashboard", { filter });
 }
 export async function saveConfig(config: GatewayConfig) { if (!isTauri()) { demo.config = config; return; } await invoke("save_config", { config }); }
 export async function saveProvider(provider: Provider) { if (!isTauri()) { const i = demo.providers.findIndex(p => p.id === provider.id); i < 0 ? demo.providers.push(provider) : demo.providers.splice(i, 1, provider); return; } await invoke("save_provider", { provider }); }
 export async function fetchProviderModels(provider: Provider): Promise<string[]> { if (!isTauri()) return Promise.resolve(provider.models.length ? provider.models : ["model-fast", "model-balanced", "model-reasoning"]); return invoke("fetch_provider_models", { provider }); }
+export async function fetchProviderBalance(provider: Provider): Promise<BalanceInfo> { if (!isTauri()) return Promise.resolve({ total: 120, used: 25.4, remaining: 94.6, currency: "USD" }); return invoke("fetch_provider_balance", { provider }); }
 export async function deleteProvider(id: string) { if (!isTauri()) { demo.providers = demo.providers.filter(p => p.id !== id); return; } await invoke("delete_provider", { id }); }
 export async function saveAlias(alias: ModelAlias) { if (!isTauri()) { const i = demo.aliases.findIndex(a => a.id === alias.id); i < 0 ? demo.aliases.push(alias) : demo.aliases.splice(i, 1, alias); return; } await invoke("save_alias", { alias }); }
 export async function deleteAlias(id: string) { if (!isTauri()) { demo.aliases = demo.aliases.filter(a => a.id !== id); return; } await invoke("delete_alias", { id }); }
 export async function resetCircuit(providerId: string) { if (!isTauri()) return; await invoke("reset_circuit", { providerId }); }
-export async function seedDemo() { if (!isTauri()) return; await invoke("seed_demo_data"); }
+const demoBackups: BackupEntry[] = [{ fileName: "fluxgate-20260726-090000.db", sizeBytes: 220_000, createdMs: Date.now() - 7_200_000 }];
+export async function getStorageInfo(): Promise<StorageInfo> { if (!isTauri()) return Promise.resolve({ dataDir: "C:/Users/demo/AppData/Roaming/dev.fluxgate.desktop", defaultDir: "C:/Users/demo/AppData/Roaming/dev.fluxgate.desktop", isCustom: false, dbSizeBytes: 245760 }); return invoke("storage_info"); }
+export async function chooseDirectory(): Promise<string | null> { if (!isTauri()) return Promise.resolve(null); return invoke("choose_directory"); }
+export async function setDataDirectory(path: string) { if (!isTauri()) return; await invoke("set_data_directory", { path }); }
+export async function resetDataDirectory() { if (!isTauri()) return; await invoke("reset_data_directory"); }
+export async function openDataDirectory() { if (!isTauri()) return; await invoke("open_data_directory"); }
+export async function backupNow(): Promise<BackupEntry> { if (!isTauri()) { const entry = { fileName: `fluxgate-demo-${Date.now()}.db`, sizeBytes: 220_000, createdMs: Date.now() }; demoBackups.unshift(entry); return entry; } return invoke("backup_now"); }
+export async function backupList(): Promise<BackupEntry[]> { if (!isTauri()) return Promise.resolve([...demoBackups]); return invoke("backup_list"); }
+export async function backupDelete(fileName: string) { if (!isTauri()) { const i = demoBackups.findIndex(b => b.fileName === fileName); if (i >= 0) demoBackups.splice(i, 1); return; } await invoke("backup_delete", { fileName }); }
+export async function backupRestore(fileName: string) { if (!isTauri()) return; await invoke("backup_restore", { fileName }); }
+export async function webdavTest(config: WebdavConfig) { if (!isTauri()) return; await invoke("webdav_test", { config }); }
+export async function webdavUpload(config: WebdavConfig): Promise<SyncReport> { if (!isTauri()) return Promise.resolve({ remoteFile: `${config.url}/${config.remoteDir}/fluxgate.db`, sizeBytes: 245760 }); return invoke("webdav_upload", { config }); }
+export async function webdavDownload(config: WebdavConfig): Promise<SyncReport> { if (!isTauri()) return Promise.resolve({ remoteFile: `${config.url}/${config.remoteDir}/fluxgate.db`, sizeBytes: 245760 }); return invoke("webdav_download", { config }); }
+export async function restartApp() { if (!isTauri()) return; await invoke("restart_app"); }
+export async function checkUpdate(): Promise<UpdateInfo | null> { if (!isTauri()) return Promise.resolve(null); return invoke("check_update"); }
+export async function installUpdate() { if (!isTauri()) return; await invoke("install_update"); }

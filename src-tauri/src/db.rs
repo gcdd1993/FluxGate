@@ -34,6 +34,24 @@ impl Database {
             conn: Mutex::new(conn),
         })
     }
+    /// Write a consistent snapshot of the live database to `target` using
+    /// `VACUUM INTO`, which is safe while other connections keep writing.
+    /// The target file must not exist yet.
+    pub fn snapshot_to(&self, target: &Path) -> Result<()> {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target = target
+            .to_str()
+            .context("snapshot target path is not valid UTF-8")?;
+        self.conn
+            .lock()
+            .expect("db lock")
+            .execute("VACUUM INTO ?1", [target])
+            .context("snapshot FluxGate database")?;
+        Ok(())
+    }
+
     pub fn config(&self) -> GatewayConfig {
         let conn = self.conn.lock().expect("db lock");
         conn.query_row(
@@ -226,40 +244,6 @@ impl Database {
             group(&logs, false),
             logs,
         ))
-    }
-    pub fn seed_demo(&self) -> Result<()> {
-        for i in 0..28 {
-            let client = match i % 3 {
-                0 => "codex",
-                1 => "claude",
-                _ => "openai",
-            };
-            let l = RequestLog {
-                id: 0,
-                timestamp: (Utc::now() - Duration::hours(i * 5)).to_rfc3339(),
-                client: client.into(),
-                provider_name: "Local Demo".into(),
-                provider_id: "demo".into(),
-                model: if i % 2 == 0 {
-                    "gpt-5.2-codex".into()
-                } else {
-                    "claude-sonnet-4-5".into()
-                },
-                input_tokens: 1800 + i * 41,
-                output_tokens: 420 + i * 13,
-                cached_tokens: if i % 3 == 0 { 700 } else { 0 },
-                cost: 0.025 + i as f64 * 0.001,
-                latency_ms: 1100 + i * 45,
-                status: if i == 9 { 429 } else { 200 },
-                error: if i == 9 {
-                    Some("Demo rate limit event".into())
-                } else {
-                    None
-                },
-            };
-            self.insert_log(&l)?;
-        }
-        Ok(())
     }
 }
 

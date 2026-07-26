@@ -14,7 +14,23 @@ export interface Provider {
   failures: number;
   models: string[];
   customUserAgent?: string | null;
+  /** 控制台余额查询配置；kind 为空表示不查询。 */
+  balance?: BalanceQuery;
 }
+
+/** 参考 cc-switch 的 NewAPI 用量预设：访问令牌 + 用户 ID 查询控制台余额。 */
+export interface BalanceQuery {
+  /** "" 表示不查询，目前支持 "newapi"。 */
+  kind: string;
+  /** 控制台地址，留空则由供应商 Base URL 推导根路径。 */
+  baseUrl: string;
+  /** 在控制台「个人设置 → 安全设置」生成的访问令牌。 */
+  token: string;
+  /** 控制台用户 ID，作为 New-Api-User 请求头发送。 */
+  userId: string;
+}
+
+export interface BalanceInfo { total: number; used: number; remaining: number; currency: string }
 
 export interface ModelAlias {
   id: string;
@@ -39,7 +55,18 @@ export interface GatewayConfig {
   recoverySeconds: number;
   maxRetries: number;
   rectifier: RectifierConfig;
+  /** 自动给 Anthropic 请求注入 cache_control 缓存断点。 */
+  cacheInjection: boolean;
+  minimizeToTray: boolean;
+  launchAtLogin: boolean;
+  webdav: WebdavConfig;
 }
+
+export interface WebdavConfig { url: string; username: string; password: string; remoteDir: string }
+export interface StorageInfo { dataDir: string; defaultDir: string; isCustom: boolean; dbSizeBytes: number }
+export interface BackupEntry { fileName: string; sizeBytes: number; createdMs: number }
+export interface SyncReport { remoteFile: string; sizeBytes: number }
+export interface UpdateInfo { version: string; notes: string }
 
 export interface RectifierConfig {
   enabled: boolean;

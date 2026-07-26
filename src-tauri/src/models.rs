@@ -37,6 +37,39 @@ pub struct Provider {
     /// client User-Agent, matching cc-switch's default routing behavior.
     #[serde(default)]
     pub custom_user_agent: Option<String>,
+    /// Console balance-query settings; `kind` empty means disabled.
+    #[serde(default)]
+    pub balance: BalanceQuery,
+}
+
+/// How to query the remaining balance on a provider's console. Modeled after
+/// cc-switch's usage-script presets: NewAPI-style consoles authenticate with a
+/// personal access token + user id rather than the relay API key.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceQuery {
+    /// "" (disabled) or "newapi"; new kinds plug into balance.rs.
+    #[serde(default)]
+    pub kind: String,
+    /// Console root override. Empty derives it from the provider base URL.
+    #[serde(default)]
+    pub base_url: String,
+    /// Access token generated in the console's personal security settings.
+    #[serde(default)]
+    pub token: String,
+    /// Console user id, sent as the `New-Api-User` header.
+    #[serde(default)]
+    pub user_id: String,
+}
+
+/// Snapshot of an upstream account balance returned by `balance::fetch`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceInfo {
+    pub total: f64,
+    pub used: f64,
+    pub remaining: f64,
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +150,39 @@ pub struct GatewayConfig {
     pub max_retries: u32,
     #[serde(default)]
     pub rectifier: RectifierConfig,
+    /// Inject `cache_control` breakpoints into Anthropic-bound requests so
+    /// clients that never mark prompts still hit Anthropic's prompt cache.
+    #[serde(default = "default_true")]
+    pub cache_injection: bool,
+    /// Hide to the system tray instead of exiting when the window closes.
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
+    /// Start FluxGate automatically at login.
+    #[serde(default)]
+    pub launch_at_login: bool,
+    /// WebDAV cloud-sync endpoint for the database snapshot.
+    #[serde(default)]
+    pub webdav: WebdavConfig,
+}
+
+/// Connection settings for syncing the database snapshot over WebDAV.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebdavConfig {
+    /// Server base URL, e.g. `https://dav.jianguoyun.com/dav`.
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Remote folder (may be nested, e.g. `fluxgate/main`).
+    #[serde(default = "default_webdav_dir")]
+    pub remote_dir: String,
+}
+
+fn default_webdav_dir() -> String {
+    "fluxgate".into()
 }
 impl Default for GatewayConfig {
     fn default() -> Self {
@@ -140,6 +206,13 @@ impl Default for GatewayConfig {
             recovery_seconds: 60,
             max_retries: 3,
             rectifier: RectifierConfig::default(),
+            cache_injection: true,
+            minimize_to_tray: true,
+            launch_at_login: false,
+            webdav: WebdavConfig {
+                remote_dir: default_webdav_dir(),
+                ..WebdavConfig::default()
+            },
         }
     }
 }

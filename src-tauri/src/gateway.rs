@@ -1,4 +1,5 @@
 use crate::{
+    cache_injector,
     db::Database,
     models::{ClientKind, GatewayConfig, ModelAlias, Provider, RequestLog},
     rectifier,
@@ -29,6 +30,22 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 struct Circuit {
     failures: u32,
     opened_at: Option<Instant>,
+}
+
+/// One provider/model candidate for a proxied request. Entries survive across
+/// failover rounds so transient failures can be retried with backoff, while
+/// `exhausted` removes providers whose errors will not heal on retry.
+struct UpstreamAttempt {
+    provider: Provider,
+    model: String,
+    payload: Value,
+    rectifier_retry_available: bool,
+    exhausted: bool,
+}
+
+/// Backoff between failover rounds: 250ms, 500ms, 1s, capped at 2s.
+fn retry_delay(round: u32) -> Duration {
+    Duration::from_millis((250u64 << round.saturating_sub(1).min(3)).min(2000))
 }
 
 struct StreamLogContext {
@@ -173,6 +190,12 @@ impl GatewayState {
                 .expect("http client"),
         }
     }
+    /// Shared outbound HTTP client, reused by auxiliary lookups such as
+    /// balance queries so they inherit the same connection pool.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     pub async fn reset_circuit(&self, id: &str) {
         self.circuits.lock().await.remove(id);
         let mut providers = self.providers.write().await;
@@ -281,9 +304,6 @@ async fn proxy_inner(
     started: Instant,
 ) -> Response<Body> {
     let config = state.config.read().await.clone();
-    if !config.enabled {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "FluxGate is paused");
-    }
     let path = req.uri().path().to_string();
     let query = req
         .uri()
@@ -297,11 +317,11 @@ async fn proxy_inner(
         );
     }
     let client = detect_client(&path);
-    if !config.clients.enabled(&client) {
-        return error(StatusCode::FORBIDDEN, "Routing for this client is disabled");
-    }
     let method = req.method().clone();
     let headers = req.headers().clone();
+    if method == http::Method::GET && (path == "/models" || path.ends_with("/v1/models")) {
+        return list_models(&state, &headers).await;
+    }
     let body = match to_bytes(req.into_body(), 64 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("Invalid body: {e}")),
@@ -358,7 +378,7 @@ async fn proxy_inner(
     if attempts.is_empty() {
         return error(
             StatusCode::BAD_GATEWAY,
-            "No enabled provider/model target matches this request",
+            "No provider/model target matches this request",
         );
     }
     let alias_failover = alias
@@ -366,21 +386,15 @@ async fn proxy_inner(
         .map(|value| value.failover_enabled)
         .unwrap_or(false);
     let allow_failover = alias_failover || config.auto_failover.enabled(&client);
-    let max_attempts = if allow_failover {
-        if alias.is_some() {
-            attempts.len()
-        } else {
-            attempts.len().min((config.max_retries + 1) as usize)
-        }
-    } else {
-        1
-    };
-    attempts.truncate(max_attempts);
-    let mut last_error = "No provider attempted".to_string();
+    if !allow_failover {
+        attempts.truncate(1);
+    }
+    // Build the attempt pool up front. Healthy providers keep their priority
+    // order; circuit-open ones move to the back as a last resort, so a request
+    // only fails after every upstream has actually been tried.
+    let mut pool: Vec<UpstreamAttempt> = Vec::with_capacity(attempts.len());
+    let mut cooling: Vec<UpstreamAttempt> = Vec::new();
     for (provider, routed_model) in attempts {
-        if circuit_open(&state, &provider.id, config.recovery_seconds).await {
-            continue;
-        }
         let mut attempt_payload = payload.clone();
         if let Some(object) = attempt_payload.as_object_mut() {
             object.insert("model".into(), Value::String(routed_model.clone()));
@@ -388,153 +402,342 @@ async fn proxy_inner(
         if provider.protocol == "openai" && path.ends_with("/chat/completions") {
             inject_stream_include_usage(&mut attempt_payload);
         }
+        // Anthropic upstreams receive the client's Messages payload verbatim,
+        // so this is the last spot where cache breakpoints can be added.
+        if config.cache_injection && provider.protocol == "anthropic" && path.ends_with("/messages")
+        {
+            cache_injector::inject(&mut attempt_payload);
+        }
         attempt_payload = rectifier::preflight(&attempt_payload, &routed_model, &config.rectifier);
-        let mut rectifier_retry_available = true;
-        loop {
-            match forward(
-                &state,
-                &provider,
-                &client,
-                &method,
-                &path,
-                &query,
-                &headers,
-                &attempt_payload,
-                &body,
-            )
-            .await
-            {
-                Ok(upstream) => {
-                    let status = upstream.status();
-                    let response_headers = upstream.headers().clone();
-                    let is_stream = response_headers
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v.contains("text/event-stream"))
-                        .unwrap_or(false);
-                    if status.is_success() {
-                        mark_success(&state, &provider.id).await;
-                        if is_stream {
-                            let log_context = StreamLogContext {
-                                state: state.clone(),
-                                provider: provider.clone(),
-                                client: client.clone(),
-                                model: routed_model.clone(),
-                                started,
-                                config: config.clone(),
-                            };
-                            match stream_response(status, response_headers, upstream, log_context)
+        let open = circuit_open(&state, &provider.id, config.recovery_seconds).await;
+        let entry = UpstreamAttempt {
+            provider,
+            model: routed_model,
+            payload: attempt_payload,
+            rectifier_retry_available: true,
+            exhausted: false,
+        };
+        if open {
+            cooling.push(entry);
+        } else {
+            pool.push(entry);
+        }
+    }
+    pool.extend(cooling);
+    // `max_retries` counts extra failover rounds. Every round walks the whole
+    // pool in priority order, so a single request keeps failing over and
+    // retrying transient errors before the caller ever sees a failure.
+    let rounds = config.max_retries.saturating_add(1);
+    let mut last_error = "No provider attempted".to_string();
+    let mut last_status = StatusCode::BAD_GATEWAY;
+    for round in 0..rounds {
+        if pool.iter().all(|entry| entry.exhausted) {
+            break;
+        }
+        if round > 0 {
+            tokio::time::sleep(retry_delay(round)).await;
+        }
+        for entry in pool.iter_mut() {
+            if entry.exhausted {
+                continue;
+            }
+            let provider = entry.provider.clone();
+            let routed_model = entry.model.clone();
+            loop {
+                match forward(
+                    &state,
+                    &provider,
+                    &client,
+                    &method,
+                    &path,
+                    &query,
+                    &headers,
+                    &entry.payload,
+                    &body,
+                )
+                .await
+                {
+                    Ok(upstream) => {
+                        let status = upstream.status();
+                        let response_headers = upstream.headers().clone();
+                        let is_stream = response_headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| v.contains("text/event-stream"))
+                            .unwrap_or(false);
+                        if status.is_success() {
+                            mark_success(&state, &provider.id).await;
+                            if is_stream {
+                                let log_context = StreamLogContext {
+                                    state: state.clone(),
+                                    provider: provider.clone(),
+                                    client: client.clone(),
+                                    model: routed_model.clone(),
+                                    started,
+                                    config: config.clone(),
+                                };
+                                match stream_response(
+                                    status,
+                                    response_headers,
+                                    upstream,
+                                    log_context,
+                                )
                                 .await
-                            {
-                                Ok(response) => return response,
-                                Err(stream_error) => {
-                                    last_error = format!(
-                                        "{} returned an SSE error: {}",
-                                        provider.name, stream_error
-                                    );
-                                    mark_failure(&state, &provider.id, config.failure_threshold)
+                                {
+                                    Ok(response) => return response,
+                                    Err(stream_error) => {
+                                        last_error = format!(
+                                            "{} returned an SSE error: {}",
+                                            provider.name, stream_error
+                                        );
+                                        last_status = StatusCode::BAD_GATEWAY;
+                                        mark_failure(&state, &provider.id, config.failure_threshold)
+                                            .await;
+                                        log_request(
+                                            &state,
+                                            &provider,
+                                            &client,
+                                            &routed_model,
+                                            0,
+                                            0,
+                                            0,
+                                            0.0,
+                                            started.elapsed().as_millis() as i64,
+                                            502,
+                                            Some(stream_error.chars().take(400).collect()),
+                                            &config,
+                                        )
                                         .await;
-                                    log_request(
-                                        &state,
-                                        &provider,
-                                        &client,
-                                        &routed_model,
-                                        0,
-                                        0,
-                                        0,
-                                        0.0,
-                                        started.elapsed().as_millis() as i64,
-                                        502,
-                                        Some(stream_error.chars().take(400).collect()),
-                                        &config,
-                                    )
-                                    .await;
-                                    break;
+                                        break;
+                                    }
                                 }
                             }
+                            let bytes = match upstream.bytes().await {
+                                Ok(x) => x,
+                                Err(e) => return error(StatusCode::BAD_GATEWAY, &e.to_string()),
+                            };
+                            let usage = parse_usage(&bytes);
+                            let cost = estimate_cost(&routed_model, usage.0, usage.1, usage.2);
+                            let bytes = adapt_response(&client, &provider.protocol, bytes);
+                            log_request(
+                                &state,
+                                &provider,
+                                &client,
+                                &routed_model,
+                                usage.0,
+                                usage.1,
+                                usage.2,
+                                cost,
+                                started.elapsed().as_millis() as i64,
+                                status.as_u16() as i64,
+                                None,
+                                &config,
+                            )
+                            .await;
+                            return bytes_response(status, response_headers, bytes);
                         }
-                        let bytes = match upstream.bytes().await {
-                            Ok(x) => x,
-                            Err(e) => return error(StatusCode::BAD_GATEWAY, &e.to_string()),
-                        };
-                        let usage = parse_usage(&bytes);
-                        let cost = estimate_cost(&routed_model, usage.0, usage.1, usage.2);
-                        let bytes = adapt_response(&client, &provider.protocol, bytes);
+                        let text = upstream.text().await.unwrap_or_default();
+                        if entry.rectifier_retry_available {
+                            if let Some(rectified) = rectifier::rectify_for_error(
+                                &entry.payload,
+                                &text,
+                                &config.rectifier,
+                            ) {
+                                entry.payload = rectified;
+                                entry.rectifier_retry_available = false;
+                                continue;
+                            }
+                        }
+                        let snippet: String = text.chars().take(300).collect();
+                        last_error = format!("{} returned {}: {}", provider.name, status, snippet);
+                        last_status = status;
                         log_request(
                             &state,
                             &provider,
                             &client,
                             &routed_model,
-                            usage.0,
-                            usage.1,
-                            usage.2,
-                            cost,
+                            0,
+                            0,
+                            0,
+                            0.0,
                             started.elapsed().as_millis() as i64,
                             status.as_u16() as i64,
-                            None,
+                            Some(text.chars().take(400).collect()),
                             &config,
                         )
                         .await;
-                        return bytes_response(status, response_headers, bytes);
-                    }
-                    let text = upstream.text().await.unwrap_or_default();
-                    if rectifier_retry_available {
-                        if let Some(rectified) =
-                            rectifier::rectify_for_error(&attempt_payload, &text, &config.rectifier)
-                        {
-                            attempt_payload = rectified;
-                            rectifier_retry_available = false;
-                            continue;
+                        if retryable(status) {
+                            mark_failure(&state, &provider.id, config.failure_threshold).await;
+                        } else {
+                            // Client-class errors will not heal on retry: surface
+                            // them directly when failover is off, otherwise drop
+                            // this provider for the remaining rounds.
+                            if !allow_failover {
+                                return error(status, &last_error);
+                            }
+                            entry.exhausted = true;
                         }
+                        break;
                     }
-                    last_error = format!("{} returned {}", provider.name, status);
-                    mark_failure(&state, &provider.id, config.failure_threshold).await;
-                    log_request(
-                        &state,
-                        &provider,
-                        &client,
-                        &routed_model,
-                        0,
-                        0,
-                        0,
-                        0.0,
-                        started.elapsed().as_millis() as i64,
-                        status.as_u16() as i64,
-                        Some(text.chars().take(400).collect()),
-                        &config,
-                    )
-                    .await;
-                    if !retryable(status) && !alias_failover {
-                        return error(status, &last_error);
+                    Err(e) => {
+                        last_error = format!("{}: {e}", provider.name);
+                        last_status = StatusCode::BAD_GATEWAY;
+                        mark_failure(&state, &provider.id, config.failure_threshold).await;
+                        log_request(
+                            &state,
+                            &provider,
+                            &client,
+                            &routed_model,
+                            0,
+                            0,
+                            0,
+                            0.0,
+                            started.elapsed().as_millis() as i64,
+                            502,
+                            Some(e.to_string()),
+                            &config,
+                        )
+                        .await;
+                        break;
                     }
-                    break;
-                }
-                Err(e) => {
-                    last_error = format!("{}: {e}", provider.name);
-                    mark_failure(&state, &provider.id, config.failure_threshold).await;
-                    log_request(
-                        &state,
-                        &provider,
-                        &client,
-                        &routed_model,
-                        0,
-                        0,
-                        0,
-                        0.0,
-                        started.elapsed().as_millis() as i64,
-                        502,
-                        Some(e.to_string()),
-                        &config,
-                    )
-                    .await;
-                    break;
                 }
             }
         }
     }
     error(
-        StatusCode::BAD_GATEWAY,
+        last_status,
         &format!("All upstream providers failed. {last_error}"),
+    )
+}
+
+/// Serve `GET /v1/models` locally instead of proxying it to the P1 upstream.
+/// The list aggregates the cached model lists of every *enabled* provider that
+/// matches the caller's client family, plus every enabled model alias, so
+/// OpenAI-compatible tools see the full routable catalogue in one call.
+/// Upstream models that are already reachable through an alias are collapsed
+/// into the alias entry, so e.g. `deepseek-ai/deepseek-v4-flash` never shows
+/// up next to a `deepseek-v4-flash` alias that routes to it.
+async fn list_models(state: &Arc<GatewayState>, headers: &HeaderMap) -> Response<Body> {
+    // Anthropic-style clients authenticate with x-api-key / anthropic-version;
+    // OpenAI- and Codex-compatible tools use bearer auth on the same path.
+    let is_claude = headers.contains_key("x-api-key") || headers.contains_key("anthropic-version");
+    let kind_ok = |client: &str| {
+        client == "all"
+            || if is_claude {
+                client == "claude"
+            } else {
+                client != "claude"
+            }
+    };
+    let mut eligible = state
+        .providers
+        .read()
+        .await
+        .iter()
+        .filter(|provider| provider.enabled && kind_ok(&provider.client))
+        .cloned()
+        .collect::<Vec<_>>();
+    eligible.sort_by_key(|provider| provider.priority);
+    // Providers whose model list was never fetched in the UI get one live
+    // discovery attempt with a short timeout, so the endpoint stays useful on
+    // fresh installs without blocking on a slow upstream.
+    let missing = eligible
+        .iter()
+        .filter(|provider| provider.models.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let fetches = missing.into_iter().map(|provider| {
+            let state = state.clone();
+            async move {
+                match tokio::time::timeout(
+                    Duration::from_secs(4),
+                    state.fetch_provider_models(&provider),
+                )
+                .await
+                {
+                    Ok(Ok(models)) => Some((provider.id.clone(), models)),
+                    _ => None,
+                }
+            }
+        });
+        let fetched = futures_util::future::join_all(fetches)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<HashMap<String, Vec<String>>>();
+        if !fetched.is_empty() {
+            let mut guard = state.providers.write().await;
+            for provider in guard.iter_mut() {
+                if let Some(models) = fetched.get(&provider.id) {
+                    provider.models = models.clone();
+                    let _ = state.db.save_provider(provider);
+                }
+            }
+            drop(guard);
+            for provider in eligible.iter_mut() {
+                if let Some(models) = fetched.get(&provider.id) {
+                    provider.models = models.clone();
+                }
+            }
+        }
+    }
+    let mut aliases = state.aliases.read().await.clone();
+    for alias in aliases.iter_mut() {
+        alias.normalize();
+    }
+    let created = Utc::now().timestamp();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Upstream model IDs that an enabled alias already routes to are hidden
+    // from the raw listing: clients should pick the stable alias name instead.
+    // Matching is case-insensitive so provider-side casing variants collapse too.
+    let mut aliased: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut data = Vec::new();
+    for alias in aliases
+        .iter()
+        .filter(|alias| alias.enabled && kind_ok(&alias.client))
+    {
+        for target in &alias.targets {
+            aliased.insert(target.upstream_model.trim().to_lowercase());
+        }
+        if seen.insert(alias.alias.clone()) {
+            data.push(json!({
+                "id": alias.alias,
+                "object": "model",
+                "type": "model",
+                "created": created,
+                "owned_by": "fluxgate-alias",
+                "display_name": alias.alias,
+            }));
+        }
+    }
+    for provider in &eligible {
+        for model in &provider.models {
+            if aliased.contains(&model.trim().to_lowercase()) {
+                continue;
+            }
+            if seen.insert(model.clone()) {
+                data.push(json!({
+                    "id": model,
+                    "object": "model",
+                    "type": "model",
+                    "created": created,
+                    "owned_by": provider.name,
+                    "display_name": model,
+                }));
+            }
+        }
+    }
+    data.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .cmp(&b["id"].as_str().unwrap_or_default().to_lowercase())
+    });
+    json_response(
+        StatusCode::OK,
+        json!({"object": "list", "data": data, "has_more": false}),
     )
 }
 
@@ -1105,6 +1308,7 @@ data: [DONE]
             failures: 0,
             models: Vec::new(),
             custom_user_agent: Some("provider-client/1.0".into()),
+            balance: Default::default(),
         };
         let mut incoming = HeaderMap::new();
         incoming.insert("user-agent", HeaderValue::from_static("workbuddy/1.0"));
@@ -1138,6 +1342,7 @@ data: [DONE]
             failures: 0,
             models: Vec::new(),
             custom_user_agent: None,
+            balance: Default::default(),
         };
         let mut incoming = HeaderMap::new();
         incoming.insert("user-agent", HeaderValue::from_static("workbuddy/1.0"));
@@ -1177,12 +1382,114 @@ data: [DONE]
             failures: 0,
             models: Vec::new(),
             custom_user_agent: None,
+            balance: Default::default(),
         };
         assert_eq!(
             state.fetch_provider_models(&provider).await.unwrap(),
             vec!["model-a", "model-z"]
         );
         server.abort();
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_aggregates_enabled_providers_and_aliases() {
+        let provider = |id: &str, client: &str, enabled: bool, models: &[&str]| Provider {
+            id: id.into(),
+            name: id.into(),
+            protocol: "openai".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "test".into(),
+            enabled,
+            priority: 1,
+            client: client.into(),
+            health: "healthy".into(),
+            failures: 0,
+            models: models.iter().map(|model| model.to_string()).collect(),
+            custom_user_agent: None,
+            balance: Default::default(),
+        };
+        let alias = ModelAlias {
+            id: "alias-1".into(),
+            alias: "coding-fast".into(),
+            targets: vec![
+                crate::models::AliasTarget {
+                    id: "t1".into(),
+                    provider_id: "p1".into(),
+                    upstream_model: "m-a".into(),
+                    enabled: true,
+                },
+                // Disabled target with different casing: its upstream model must
+                // still collapse into the alias entry, case-insensitively.
+                crate::models::AliasTarget {
+                    id: "t2".into(),
+                    provider_id: "p2".into(),
+                    upstream_model: "M-C".into(),
+                    enabled: false,
+                },
+            ],
+            provider_id: String::new(),
+            upstream_model: String::new(),
+            client: "all".into(),
+            enabled: true,
+            failover_enabled: true,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "fluxgate-models-list-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(Database::open(&path).unwrap());
+        let state = Arc::new(GatewayState::new(
+            db,
+            GatewayConfig::default(),
+            vec![
+                provider("p1", "openai", true, &["m-b", "m-a"]),
+                provider("p2", "all", true, &["m-a", "m-c"]),
+                provider("p3", "openai", false, &["m-disabled"]),
+                provider("p4", "claude", true, &["m-claude-only"]),
+            ],
+            vec![alias],
+        ));
+
+        // OpenAI-compatible listing: bearer auth, aggregates openai + all
+        // providers; m-a and m-c are alias targets so only the alias shows.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_inner(state.clone(), request, Instant::now()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let ids = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["coding-fast", "m-b"]);
+
+        // Anthropic-style listing: x-api-key marks a Claude client, so the
+        // claude + all providers are aggregated instead.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("x-api-key", "test")
+            .body(Body::empty())
+            .unwrap();
+        let response = proxy_inner(state.clone(), request, Instant::now()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let ids = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["coding-fast", "m-claude-only"]);
         drop(state);
         let _ = std::fs::remove_file(path);
     }
@@ -1222,6 +1529,7 @@ data: [DONE]
             failures: 0,
             models: Vec::new(),
             custom_user_agent: None,
+            balance: Default::default(),
         };
         let providers = vec![
             provider("p1", failed_address),
@@ -1281,6 +1589,148 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn injects_cache_breakpoints_into_anthropic_bound_requests() {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let handler_bodies = bodies.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let bodies = handler_bodies.clone();
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    axum::Json(json!({"id":"ok","type":"message","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = Provider {
+            id: "p1".into(),
+            name: "p1".into(),
+            protocol: "anthropic".into(),
+            base_url: format!("http://{address}/v1"),
+            api_key: "test".into(),
+            enabled: true,
+            priority: 1,
+            client: "claude".into(),
+            health: "healthy".into(),
+            failures: 0,
+            models: Vec::new(),
+            custom_user_agent: None,
+            balance: Default::default(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "fluxgate-cache-injection-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(Database::open(&path).unwrap());
+        let state = Arc::new(GatewayState::new(
+            db,
+            GatewayConfig::default(),
+            vec![provider],
+            Vec::new(),
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-api-key", "client-key")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet",
+                    "system": "be helpful",
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                    "max_tokens": 32
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = proxy_inner(state.clone(), request, Instant::now()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bodies = bodies.lock().unwrap();
+        // String system was converted to a marked block and the newest
+        // message got a breakpoint before the payload left the gateway.
+        assert!(bodies[0]["system"][0].get("cache_control").is_some());
+        assert!(bodies[0]["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_some());
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn transient_upstream_error_is_retried_within_one_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        // First call fails with a retryable 500; the second succeeds. The
+        // gateway must absorb the transient failure inside a single request.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let calls = handler_calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error":{"message":"ResourceExhausted: Worker local total request limit reached (48/48)"}})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({"id":"ok","model":body["model"],"choices":[{"message":{"content":"done"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = Provider {
+            id: "p1".into(),
+            name: "p1".into(),
+            protocol: "openai".into(),
+            base_url: format!("http://{address}/v1"),
+            api_key: "test".into(),
+            enabled: true,
+            priority: 1,
+            client: "all".into(),
+            health: "healthy".into(),
+            failures: 0,
+            models: Vec::new(),
+            custom_user_agent: None,
+            balance: Default::default(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "fluxgate-transient-retry-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(Database::open(&path).unwrap());
+        let state = Arc::new(GatewayState::new(
+            db,
+            GatewayConfig::default(),
+            vec![provider],
+            Vec::new(),
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"any-model","messages":[]}).to_string(),
+            ))
+            .unwrap();
+        let response = proxy_inner(state.clone(), request, Instant::now()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn rectifier_retries_same_provider_without_workbuddy_thinking() {
         let calls = Arc::new(AtomicUsize::new(0));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -1323,6 +1773,7 @@ data: [DONE]
             failures: 0,
             models: Vec::new(),
             custom_user_agent: None,
+            balance: Default::default(),
         };
         let alias = ModelAlias {
             id: "alias-1".into(),
@@ -1416,6 +1867,7 @@ data: [DONE]
             failures: 0,
             models: Vec::new(),
             custom_user_agent: None,
+            balance: Default::default(),
         };
         let alias = ModelAlias {
             id: "alias-sse".into(),
