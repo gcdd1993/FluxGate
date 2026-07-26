@@ -47,6 +47,28 @@ jobs:
           fi
           echo "signing key present, length: ${#TAURI_SIGNING_PRIVATE_KEY}"
 
+      # Release 正文取自 CHANGELOG.md 中与 tag 版本对应的小节；
+      # 找不到对应小节时退回一句通用说明，保证发版不被阻塞。
+      - name: Extract changelog section
+        id: changelog
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" {found=1; next}
+            /^## \[/ {if (found) exit}
+            found {print}
+          ' CHANGELOG.md > release-body.md
+          if [ ! -s release-body.md ]; then
+            echo "CHANGELOG.md 中未找到 [$version] 小节，使用默认正文" >&2
+          fi
+          printf '\n---\n\n下载下方安装包安装；已安装的用户会通过应用内自动更新收到本版本。\n' >> release-body.md
+          {
+            echo "body<<FLUXGATE_RELEASE_BODY"
+            cat release-body.md
+            echo "FLUXGATE_RELEASE_BODY"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -56,6 +78,6 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "FluxGate ${{ github.ref_name }}"
-          releaseBody: "下载下方安装包安装；已安装的用户会通过应用内自动更新收到本版本。"
+          releaseBody: ${{ steps.changelog.outputs.body }}
           releaseDraft: false
           prerelease: false
