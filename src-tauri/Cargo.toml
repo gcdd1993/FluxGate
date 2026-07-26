@@ -1,0 +1,32 @@
+[package]
+name = "fluxgate"
+version = "0.1.0"
+description = "A local-first AI gateway for Codex, Claude and OpenAI-compatible clients"
+authors = ["FluxGate Contributors"]
+edition = "2021"
+
+[lib]
+name = "fluxgate_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["macros"] }
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+futures-util = "0.3"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+toml_edit = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
