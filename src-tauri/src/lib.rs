@@ -44,6 +44,11 @@ fn show_main_window(app: &AppHandle) {
 
 fn apply_autostart(app: &AppHandle, enabled: bool) {
     let manager = app.autolaunch();
+    // Disabling an entry that was never registered fails with os error 2 on
+    // Windows, so only touch the registry when the state actually changes.
+    if manager.is_enabled().unwrap_or(false) == enabled {
+        return;
+    }
     let result = if enabled {
         manager.enable()
     } else {
