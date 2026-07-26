@@ -33,6 +33,20 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # 快速自检：secret 缺失时 30 秒内失败并给出明确提示，避免白跑 8 分钟编译。
+      # 只输出长度，绝不打印密钥内容。本地私钥文件约 300+ 字符；
+      # 如果这里显示几十个字符，说明存成路径或公钥了。
+      - name: Verify signing key secret
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret 为空或未配置（Settings → Secrets and variables → Actions → Repository secrets）"
+            exit 1
+          fi
+          echo "signing key present, length: ${#TAURI_SIGNING_PRIVATE_KEY}"
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:
