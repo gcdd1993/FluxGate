@@ -2,6 +2,19 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.0.2] - 2026-07-27
+
+### 协议与兼容
+- Claude 客户端（含 Claude Code）现可完整使用仅提供 OpenAI 兼容端点的供应商：
+  - 请求完整转换：system 提示、工具定义与 `tool_choice`、`tool_use` / `tool_result` 往返、图片（base64 / URL → `image_url`）、`temperature` / `top_p` / `stop_sequences` 等采样参数
+  - 流式实时转换：OpenAI `chat.completion.chunk` SSE 重写为 Anthropic Messages 事件流（`message_start` → `content_block_*` → `message_delta` → `message_stop`），支持工具调用增量与跨分块缓冲
+  - 非流式响应还原 `tool_use` 块并映射 `stop_reason`（`tool_calls`→`tool_use`、`length`→`max_tokens`）
+- 经转换的流式请求自动注入 `stream_options.include_usage`，Token 用量与成本统计不受影响
+
+### 修复
+- 开机自启处于关闭状态时，启动不再误报 "autostart update failed (os error 2)"：仅在自启状态实际变化时才写注册表
+- Windows release 构建不再附带控制台窗口（补上 `windows_subsystem = "windows"`）
+
 ## [0.0.1] - 2026-07-26
 
 首个公开版本。

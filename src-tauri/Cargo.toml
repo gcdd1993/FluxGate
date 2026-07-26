@@ -1,6 +1,6 @@
 [package]
 name = "fluxgate"
-version = "0.0.1"
+version = "0.0.2"
 description = "A local-first AI gateway for Codex, Claude and OpenAI-compatible clients"
 authors = ["FluxGate Contributors"]
 edition = "2021"
